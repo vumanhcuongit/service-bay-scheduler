@@ -54,6 +54,11 @@ func New(svc *service.Service, log *slog.Logger, cfg Config) http.Handler {
 
 func (h *handler) handleCreateAppointment(w http.ResponseWriter, r *http.Request) {
 	info := infoFrom(r.Context())
+	if !jsonContentType(r) {
+		info.Result = model.ResultInvalid
+		h.reject(w, r, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return
+	}
 	req, err := decodeBookingRequest(r)
 	if err != nil {
 		info.Result = model.ResultInvalid

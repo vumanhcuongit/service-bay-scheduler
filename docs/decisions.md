@@ -110,7 +110,7 @@ From the "backend" option:
 ### D9 — API
 - **What:**
   - `POST /appointments` → 201 with the appointment; 409 `{reason, message}` when the current state blocks the booking; 422 when outside hours, `start` not aligned to 15 min, `start` not in the future, or the service type does not belong to `dealership_id`; 400 on malformed input (missing field, wrong type or format, empty or null id, `start` without offset, `Idempotency-Key` not a UUID); 404 on well-formed but unknown references, naming the first unknown in the order dealership, vehicle, service type. Unknown body fields are ignored.
-  - Checks run in this order: 400 → idempotency key lookup → 404 → 422 → 409.
+  - Checks run in this order: 415 (a `Content-Type` that is not `application/json`; a missing one is accepted) → 400 → idempotency key lookup → 404 → 422 → 409.
   - 422 rules, checked in this order, first failure wins: `start` aligned to 15 min → `start` in the future → service type belongs to `dealership_id` → inside opening hours (`start >= open`, `end <= close`). Ownership comes before hours because the hours check uses the service type's duration: a service type from another dealership would give an "ends after closing" message based on a duration this dealership does not offer.
   - 409 reasons, checked in this order, first failure wins: `vehicle_busy` (the vehicle has an overlapping appointment), `no_bay`, `no_technician` (no qualified technician free). Bay and technician both busy → `no_bay`.
   - `GET /appointments/{id}`
@@ -122,6 +122,12 @@ From the "backend" option:
     - A concurrent request with the same key blocks on the key row's lock until the first commits or rolls back. Commit → it replays or gets 422 (this also covers same key + different payload at the same moment). Rollback (500, timeout, 503) → the key row is gone and the waiting request runs as new.
     - A key row older than 24 h is treated as absent and overwritten. A periodic job deletes rows older than 24 h, so the table does not grow without bound. It runs as a scheduled task outside the service (ECS scheduled task or cron; locally a make target), not as a loop in each instance, which would run it once per instance.
     - `X-Request-ID` on any response, including a replay, is the current request's.
+  - Input rules, from red-team pass 2:
+    - Ids are exact, case-sensitive strings: `" V1"` and `"v1"` are unknown ids, not `V1`.
+    - Duplicate JSON keys are out of scope: the last one wins.
+    - `Idempotency-Key` must be the hyphenated UUID form, in any case. Braces, no hyphens and `urn:uuid:` forms are a 400, and so is an empty header. The nil UUID is allowed.
+    - A lowercase `t` or `z` in `start` is a 400.
+    - `X-Request-ID` is used as given only if it matches `[A-Za-z0-9._-]{1,128}`; otherwise it is replaced with a generated one (as in `openapi.yaml`).
 - **Why:** availability is what a real client needs before it can offer the user a time. 409 reasons are machine-readable so a UI can react. Idempotency makes retries safe (mobile clients, timeouts).
 - **Considered:** returning alternative slots in the 409 body — stretch goal, not required.
 

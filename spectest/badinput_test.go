@@ -114,3 +114,29 @@ func TestMalformedBody(t *testing.T) {
 		})
 	}
 }
+
+// Red-team pass 2: a Content-Type other than application/json is a 415; a missing one is accepted.
+func TestContentType(t *testing.T) {
+	body, _ := json.Marshal(validBody())
+	for _, c := range []struct {
+		contentType string // "" sends no header
+		code        int
+	}{
+		{"", http.StatusCreated},
+		{"application/json", http.StatusCreated},
+		{"application/json; charset=utf-8", http.StatusCreated},
+		{"text/plain", http.StatusUnsupportedMediaType},
+		{"application/x-www-form-urlencoded", http.StatusUnsupportedMediaType},
+		{"application/jsonx", http.StatusUnsupportedMediaType},
+		{"application/json;;", http.StatusUnsupportedMediaType},
+	} {
+		t.Run(c.contentType, func(t *testing.T) {
+			e := newEnv(t)
+			headers := map[string]string{}
+			if c.contentType != "" {
+				headers["Content-Type"] = c.contentType
+			}
+			e.status(e.do(http.MethodPost, "/appointments", string(body), headers), c.code)
+		})
+	}
+}

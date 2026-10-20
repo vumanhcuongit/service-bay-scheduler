@@ -78,7 +78,11 @@ func TestDecisionLines(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			e := newObsEnvWith(t, c.insertErrs)
 			for _, s := range c.setup {
-				e.post(s.body, map[string]string{"Idempotency-Key": s.key})
+				h := map[string]string{}
+				if s.key != "" { // an empty header is a 400, not "no key"
+					h["Idempotency-Key"] = s.key
+				}
+				e.post(s.body, h)
 			}
 			before := e.counts(t)
 			e.logs.Reset()
@@ -142,7 +146,8 @@ func TestLatencyIncludesRetries(t *testing.T) {
 	}
 }
 
-// Rejections on the GET routes are explained by their own line too.
+// Rejections on the GET routes are explained by their own line too. Each case is a subtest, so
+// its transaction is rolled back before the next one takes a pool connection.
 func TestGetRejectionsLogged(t *testing.T) {
 	for path, want := range map[string]logLine{
 		"/availability?dealership_id=DL1&service_type_id=OIL":                  {"status": float64(400), "message": "date is required"},
@@ -150,26 +155,29 @@ func TestGetRejectionsLogged(t *testing.T) {
 		"/availability?dealership_id=DL1&service_type_id=TIRE&date=2026-10-21": {"status": float64(422), "message": "service type TIRE is not offered by dealership DL1"},
 		"/appointments/abc": {"status": float64(400), "message": "id must be a UUID"},
 	} {
-		e := newObsEnv(t)
-		e.get(path)
-		var found bool
-		for _, l := range e.lines(t) {
-			if l["msg"] == "request rejected" {
-				found = true
-				for key, v := range want {
-					if l[key] != v {
-						t.Errorf("%s: %s = %v, want %v", path, key, l[key], v)
+		t.Run(path, func(t *testing.T) {
+			e := newObsEnv(t)
+			e.get(path)
+			var found bool
+			for _, l := range e.lines(t) {
+				if l["msg"] == "request rejected" {
+					found = true
+					for key, v := range want {
+						if l[key] != v {
+							t.Errorf("%s: %s = %v, want %v", path, key, l[key], v)
+						}
 					}
 				}
 			}
-		}
-		if !found {
-			t.Errorf("%s: no request rejected line:\n%s", path, e.logs.String())
-		}
+			if !found {
+				t.Errorf("%s: no request rejected line:\n%s", path, e.logs.String())
+			}
+		})
 	}
 }
 
-// A caller's X-Request-ID goes into every log line, so only a short, plain one is kept.
+// A caller's X-Request-ID goes into every log line, so only a short, plain one is kept. Each
+// case is a subtest, so its transaction is rolled back before the next one takes a connection.
 func TestRequestIDValidated(t *testing.T) {
 	generated := regexp.MustCompile(`^[0-9a-f]{32}$`)
 	for id, kept := range map[string]bool{
@@ -180,15 +188,17 @@ func TestRequestIDValidated(t *testing.T) {
 		"has space":              false,
 		`quote"`:                 false,
 	} {
-		e := newObsEnv(t)
-		rec := httptestGet(e, "/healthz", id)
-		got := rec.Header().Get("X-Request-ID")
-		if kept && got != id {
-			t.Errorf("%q: echoed %q, want it kept", id, got)
-		}
-		if !kept && !generated.MatchString(got) {
-			t.Errorf("%q: echoed %q, want a generated id", id, got)
-		}
+		t.Run(id, func(t *testing.T) {
+			e := newObsEnv(t)
+			rec := httptestGet(e, "/healthz", id)
+			got := rec.Header().Get("X-Request-ID")
+			if kept && got != id {
+				t.Errorf("%q: echoed %q, want it kept", id, got)
+			}
+			if !kept && !generated.MatchString(got) {
+				t.Errorf("%q: echoed %q, want a generated id", id, got)
+			}
+		})
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"regexp"
 	"time"
@@ -23,11 +24,23 @@ var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 
 func isUUID(s string) bool { return uuidPattern.MatchString(s) }
 
+// jsonContentType reports whether a booking body may be read as JSON: Content-Type is missing,
+// or its media type is application/json; parameters such as charset are ignored.
+func jsonContentType(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		return true
+	}
+	mt, _, err := mime.ParseMediaType(ct)
+	return err == nil && mt == "application/json"
+}
+
 // decodeBookingRequest reads exactly one JSON object with the four schema fields, each a
 // non-empty string; unknown fields are ignored (D9). An error is a 400 naming the field.
-// An Idempotency-Key that is not a UUID is also a 400, before any lookup (N23).
+// An Idempotency-Key that is present but not a UUID, including empty, is also a 400, before
+// any lookup (N23); only a missing header means no key.
 func decodeBookingRequest(r *http.Request) (model.BookingRequest, error) {
-	if k := r.Header.Get("Idempotency-Key"); k != "" && !isUUID(k) {
+	if _, present := r.Header["Idempotency-Key"]; present && !isUUID(r.Header.Get("Idempotency-Key")) {
 		return model.BookingRequest{}, errors.New("Idempotency-Key must be a UUID")
 	}
 	var fields map[string]json.RawMessage
@@ -95,24 +108,28 @@ type availabilityQuery struct {
 	Date time.Time
 }
 
-// decodeAvailabilityQuery reads the three required query parameters. An error is a 400 naming one.
+// decodeAvailabilityQuery reads the three required query parameters, each given once. An error
+// is a 400 naming one.
 func decodeAvailabilityQuery(r *http.Request) (availabilityQuery, error) {
 	v := r.URL.Query()
 	var q availabilityQuery
+	var date string
 	for _, f := range []struct {
 		name string
 		dst  *string
 	}{
 		{"dealership_id", &q.DealershipID},
 		{"service_type_id", &q.ServiceTypeID},
+		{"date", &date},
 	} {
-		if *f.dst = v.Get(f.name); *f.dst == "" {
+		switch vals := v[f.name]; {
+		case len(vals) > 1:
+			return availabilityQuery{}, fmt.Errorf("%s must be given once", f.name)
+		case len(vals) == 0 || vals[0] == "":
 			return availabilityQuery{}, fmt.Errorf("%s is required", f.name)
+		default:
+			*f.dst = vals[0]
 		}
-	}
-	date := v.Get("date")
-	if date == "" {
-		return availabilityQuery{}, errors.New("date is required")
 	}
 	var err error
 	if q.Date, err = time.Parse(time.DateOnly, date); err != nil {

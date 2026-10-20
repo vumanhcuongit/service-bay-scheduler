@@ -114,6 +114,10 @@ func TestAvailabilityBadParams(t *testing.T) {
 		{"no service type", "dealership_id=DL1&date=" + day, http.StatusBadRequest, "service_type_id"},
 		{"unknown dealership", "dealership_id=DL9&service_type_id=OIL&date=" + day, http.StatusNotFound, "dealership DL9"},
 		{"unknown service type", "dealership_id=DL1&service_type_id=NOPE&date=" + day, http.StatusNotFound, "service type NOPE"},
+		{"repeated dealership", "dealership_id=DL1&dealership_id=DL2&service_type_id=OIL&date=" + day, http.StatusBadRequest, "dealership_id"},
+		{"repeated service type", "dealership_id=DL1&service_type_id=OIL&service_type_id=OIL&date=" + day, http.StatusBadRequest, "service_type_id"},
+		{"repeated date", "dealership_id=DL1&service_type_id=OIL&date=" + day + "&date=" + day, http.StatusBadRequest, "date"},
+		{"repeated empty", "dealership_id=&dealership_id=DL1&service_type_id=OIL&date=" + day, http.StatusBadRequest, "dealership_id"},
 		{"service type of another dealership", "dealership_id=DL1&service_type_id=TIRE&date=" + day, http.StatusUnprocessableEntity, "not offered"},
 	} {
 		r := e.get("/availability?" + c.query)
