@@ -1,0 +1,52 @@
+name: ci
+
+# push only on main; PR branches run through pull_request, so each commit runs once.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scheduler
+          POSTGRES_PASSWORD: scheduler
+          POSTGRES_DB: scheduler
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U scheduler -d scheduler"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgres://scheduler:scheduler@localhost:5432/scheduler_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.24"
+          cache: true
+
+      # Same as docker/initdb/01-test-db.sql in compose.
+      - name: Create test database
+        run: psql "postgres://scheduler:scheduler@localhost:5432/scheduler" -c "CREATE DATABASE scheduler_test"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Layers
+        run: make layers
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0 # keep in step with GOLANGCI_LINT_VERSION in the Makefile
+
+      - name: Test
+        run: make test

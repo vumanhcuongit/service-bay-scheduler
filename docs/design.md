@@ -67,7 +67,7 @@ The request-id middleware (★, highlighted) is the outermost layer, so every lo
 
 **Clock.** One interface, `Now()`. Production uses the wall clock; tests fix it (D12). Nothing else in the code calls `time.Now()`.
 
-**Repository.** Runs SQL, owns transaction start/commit/rollback, and translates constraint violations into the typed errors above by constraint name. It must not know the business rules: it doesn't decide which bay comes first or which 409 reason wins; it only returns rows and errors.
+**Repository.** Runs SQL, owns transaction start/commit/rollback, and translates constraint violations into the typed errors above by constraint name. It must not know the business rules: it doesn't decide which bay comes first or which 409 reason wins; it only returns rows and errors. The transaction travels in the context, so the repository need not import the service package that declares its interface. The cost: a call made with the wrong context runs outside the transaction. Mitigation: `InTx` is the only place a transaction starts, and the spec tests run every path inside one.
 
 **Postgres.** Holds all state. Its exclusion constraints are the last word on overlaps (§5).
 
@@ -97,7 +97,7 @@ Happy path, with a key:
 3. Domain waits a short random 50–100 ms, then starts a new transaction and re-runs from step 3. The fresh check either finds another candidate, or a real 409. The random wait keeps two losers from colliding again on the same next candidate.
 4. After 3 attempts in total, the domain returns "unavailable". Handler returns **503** with `Retry-After: 1`. Nothing is stored, so the client's retry with the same key runs as new.
 
-A vehicle violation at step 8 is different: no other candidate can fix it, so it goes straight to **409** `vehicle_busy` with no retry (D8).
+A vehicle violation at step 8 is different: no other candidate can fix it, so it goes straight to **409** `vehicle_busy` with no retry (D8). In code, "straight" is one immediate re-run with no backoff: the violation means the other booking has committed, so the fresh check at step 7 returns `vehicle_busy` and stores it on the key row like any other 409. If that re-run hits the vehicle constraint again, the domain returns **409** `vehicle_busy` without storing it, never 500.
 
 A side effect worth knowing: while A is between attempts, its key row doesn't exist. A same-key request B that was waiting on it runs as new, and A's next attempt then waits on B's key row and replays B's result. The outcome is still one booking per key.
 
@@ -160,8 +160,13 @@ The transaction runs at Postgres's default `READ COMMITTED`. Correctness doesn't
 
 **Postgres.**
 - Why: exclusion constraints on ranges. They turn "no overlapping bookings" into a rule the database enforces, which is the core of the problem. Few databases have this.
-- Considered: MySQL, which has no equivalent, so the guard would move to row locks in application code.
-- Switch when: not for this workload. Bookings are a small, relational, write-light dataset.
+- Considered: MySQL, which has no exclusion constraints. There are three ways to hold the overlap invariant there:
+  - Row locks: `SELECT … FOR UPDATE` on the bay, technician and vehicle rows, check overlap, then insert. Correct but procedural: any code path that skips the lock breaks the invariant. This is exactly what D8 rejected.
+  - Slot table: materialise 15-minute slots, `UNIQUE (resource_id, slot_start)`, one row per slot per booking (OIL = 2 rows). An overlap becomes a duplicate key, so the guard stays declarative like the exclusion constraint. Only possible because D1 fixed the slot grid. Cost: N rows per booking, and availability reads change shape.
+  - Advisory lock per dealership (`GET_LOCK`): simplest, but it serialises the whole dealership instead of one resource. Fine at this industry's volume, wasteful under load.
+
+  On MySQL I'd pick the slot table. The decision is about keeping the invariant declarative, not about the database.
+- Switch when: the platform standardises on MySQL. The slot table is the migration path, and the domain layer does not change.
 
 **Exclusion constraints as the overlap guard.**
 - Why: declarative; no future code path can skip them (D8).
