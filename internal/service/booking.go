@@ -28,11 +28,12 @@ const minBackoff = 50 * time.Millisecond
 
 // Book books req, assigning the first free bay and qualified technician (D7).
 // key is the Idempotency-Key, "" for none; it is claimed before any other check, so a stored
-// outcome replays without them (D9). After the 404 and 422 checks the dealership is locked, so
-// its availability reads and inserts run one booking at a time. A 409 is an Outcome, not an
-// error. A constraint violation or deadlock, which the lock leaves only to the same vehicle at
-// two dealerships, gets one re-run, then ErrUnavailable. A wait cut short, by the lock timeout
-// or by ctx's deadline, is ErrUnavailable at once (D8). Each booking logs one decision line (D13).
+// outcome replays without them (D9). After the 404 and 422 checks the dealership and then the
+// vehicle are locked, so a dealership's reads and inserts, and a vehicle's across dealerships,
+// run one booking at a time. A 409 is an Outcome, not an error. A constraint violation or
+// deadlock, which the locks should leave none, gets one re-run as a defence, then
+// ErrUnavailable. A wait cut short, by the lock timeout or by ctx's deadline, is
+// ErrUnavailable at once (D8). Each booking logs one decision line (D13).
 func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
 	out, err := s.book(ctx, req, key)
 	switch {
@@ -167,9 +168,14 @@ func (s *Service) attempt(ctx context.Context, req model.BookingRequest) (model.
 		return model.Outcome{}, err
 	}
 
-	// The lock covers the availability reads and the insert, nothing else: a 404 or 422 never
-	// waits on it. The key was claimed before it, always, so the two locks cannot form a cycle.
+	// The locks cover the availability reads and the insert, nothing else: a 404 or 422 never
+	// waits on them. Always in the order key (claimed before this), dealership, vehicle, so
+	// no two bookings can wait on each other in a cycle. The vehicle lock is what serialises one
+	// vehicle booked at two dealerships, which hold different dealership locks.
 	if err := s.repo.LockDealership(ctx, d.ID); err != nil {
+		return model.Outcome{}, err
+	}
+	if err := s.repo.LockVehicle(ctx, v.ID); err != nil {
 		return model.Outcome{}, err
 	}
 	vehicleHasOverlap, err := s.repo.VehicleHasOverlap(ctx, v.ID, w)

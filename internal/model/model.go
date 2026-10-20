@@ -118,10 +118,11 @@ var (
 	ErrTechnicianTaken = errors.New("technician taken")
 	ErrVehicleBusy     = errors.New("vehicle busy")
 	// ErrDeadlock is two bookings whose exclusion checks waited on each other; Postgres
-	// aborted this one. Like a constraint violation it gets the one re-run (D8).
+	// aborted this one. The locks leave none, so it is a defence; like a constraint violation
+	// it gets the one re-run (D8).
 	ErrDeadlock = errors.New("deadlocked with a concurrent booking")
-	// ErrLockTimeout is a wait on the dealership lock, or on another booking's row, past the
-	// lock timeout. It is not re-run: the wait already used most of the budget (D8).
+	// ErrLockTimeout is a wait on the idempotency key, the dealership lock or the vehicle lock
+	// past the lock timeout. It is not re-run: the wait already used most of the budget (D8).
 	ErrLockTimeout = errors.New("lock wait timed out")
 )
 

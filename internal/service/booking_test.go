@@ -77,15 +77,20 @@ func (r *recorder) LockDealership(context.Context, string) error {
 	return nil
 }
 
+func (r *recorder) LockVehicle(context.Context, string) error {
+	r.record("LockVehicle")
+	return nil
+}
+
 func (r *recorder) InsertAppointment(_ context.Context, a model.Appointment) (model.Appointment, error) {
 	r.record("InsertAppointment")
 	a.ID = "A1"
 	return a, nil
 }
 
-// The lock comes after the key claim, so the two locks are always taken in one order, and after
-// the 404 and 422 reads, so a rejection never waits on it. It comes before the availability
-// reads and the insert it protects (D8).
+// The locks are taken in one order, key, dealership, vehicle, so no two bookings can wait on
+// each other in a cycle. They come after the 404 and 422 reads, so a rejection never waits on
+// them, and before the availability reads and the insert they protect (D8).
 func TestBookCallOrder(t *testing.T) {
 	r := &recorder{}
 	svc := service.New(r, clock.NewFixed(time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)), slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -99,7 +104,7 @@ func TestBookCallOrder(t *testing.T) {
 	want := []string{
 		"ClaimKey",
 		"GetDealership", "GetVehicle", "GetServiceType", "ListBays", "ListQualifiedTechnicians",
-		"LockDealership",
+		"LockDealership", "LockVehicle",
 		"VehicleHasOverlap", "ListBusy", "InsertAppointment",
 		"SaveKeyOutcome",
 	}

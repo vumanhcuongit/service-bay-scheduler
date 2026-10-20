@@ -26,10 +26,18 @@ type Repository struct {
 
 func New(db DB) *Repository { return &Repository{db: db} }
 
-// Connect opens a pool. It sets no session state, so it works behind a transaction-mode
-// pooler (design §8); DB calls are bounded by the request deadline instead (D12).
+// Connect opens a pool that is safe behind a transaction-mode pooler (design §8): it sets no
+// session state, and it names no prepared statement. pgx's default exec mode prepares a named
+// statement per connection, which another client's transaction on a pooled connection would not
+// find; CacheDescribe caches only the statement's description and executes it unnamed.
+// DB calls are bounded by the request deadline instead of a startup parameter (D12).
 func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
@@ -49,14 +57,10 @@ func (r *Repository) q(ctx context.Context) DB {
 }
 
 // lockTimeout bounds each lock wait in a transaction, so a wait gives a 503 instead of running
-// into the request deadline (D8). It is right for the key row and the dealership lock, which
-// cannot deadlock: the key always comes first. A wait that can deadlock must allow longer than
-// Postgres's deadlock_timeout (1 s by default, superuser-only), or the detector never picks a
-// victim and both sides time out; InsertAppointment raises it to insertLockTimeout.
-const (
-	lockTimeout       = "1s"
-	insertLockTimeout = "2s"
-)
+// into the request deadline (D8). Every wait in a booking is on a lock taken in one fixed order,
+// key, dealership, vehicle, so none can be part of a cycle: a wait is only for another booking
+// to finish. Postgres's own deadlock_timeout (1 s by default) therefore never has to act first.
+const lockTimeout = "1s"
 
 // InTx is the only place a transaction starts. Inside an existing one it opens a savepoint.
 // Its first statement sets lock_timeout, before any call in fn can wait on a lock.

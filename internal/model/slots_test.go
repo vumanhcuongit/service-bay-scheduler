@@ -91,3 +91,27 @@ func TestLocalWindow(t *testing.T) {
 		t.Errorf("got [%s, %s), want [08:00, 17:00) local", from, to)
 	}
 }
+
+// Opening hours are wall-clock times, so they hold on the days the clock jumps. Midnight plus
+// 8 h counts elapsed time and opens at 09:00 after the spring jump and 07:00 after the autumn one.
+func TestLocalWindowOnDSTDays(t *testing.T) {
+	ny := mustLoad("America/New_York")
+	for _, c := range []struct {
+		name              string
+		day               time.Time
+		openUTC, closeUTC time.Time
+	}{
+		{"spring forward", time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC), time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC), time.Date(2026, 3, 8, 21, 0, 0, 0, time.UTC)},
+		{"fall back", time.Date(2026, 11, 1, 15, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 13, 0, 0, 0, time.UTC), time.Date(2026, 11, 1, 22, 0, 0, 0, time.UTC)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			from, to := LocalWindow(ny, c.day, 8*time.Hour, 17*time.Hour)
+			if !from.Equal(c.openUTC) || !to.Equal(c.closeUTC) {
+				t.Errorf("got [%s, %s), want [08:00, 17:00) New York = [%s, %s)", from.In(ny), to.In(ny), c.openUTC, c.closeUTC)
+			}
+			if from.In(ny).Format("15:04") != "08:00" || to.In(ny).Format("15:04") != "17:00" {
+				t.Errorf("got %s to %s local, want 08:00 to 17:00", from.In(ny).Format("15:04"), to.In(ny).Format("15:04"))
+			}
+		})
+	}
+}

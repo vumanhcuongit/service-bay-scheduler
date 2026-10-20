@@ -2,7 +2,7 @@
 
 Agent: red-teamer, new session, clean context. Input: the booking spec and `openapi.yaml`. It was not given `decisions.md`, the brainstorm transcript, or any code, and the prompt told it so. Asked for cases where the system could do the wrong thing and the spec does not say what should happen.
 
-Result: 20 points. 16 in (spec or decisions changed), 3 out of scope, 1 deferred. The changes are logged in [decisions.md §6](../decisions.md#6-spec-review-log) and landed in `24776f8`.
+Result: 20 points. 17 in (spec or decisions changed), 2 out of scope, 1 deferred. The changes are logged in [decisions.md §6](../decisions.md#6-spec-review-log) and landed in `24776f8`.
 
 ## Verdicts
 

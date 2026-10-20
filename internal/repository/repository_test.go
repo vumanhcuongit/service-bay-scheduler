@@ -2,7 +2,7 @@ package repository_test
 
 import (
 	"context"
-	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,64 +27,69 @@ func TestInTxReleasesConnectionOnPanic(t *testing.T) {
 	}
 }
 
-// A mapping test, not a reproduction: two inserts per transaction force a 40P01 on demand,
-// which no booking does. The deadlock it stands for is the one LockDealership leaves, the same
-// vehicle at two dealerships. Postgres aborts one, and it must reach the service as
-// model.ErrDeadlock, which gets the re-run, not as a 500. It runs through InTx, so it also
-// proves the insert's lock_timeout leaves the deadlock detector time to pick one victim.
-func TestInsertAppointmentMapsDeadlock(t *testing.T) {
+// Every write needs the transaction InTx puts in its context. Outside one, a lock would be
+// released as soon as it was taken and a key claim would commit on its own, so each call must
+// fail rather than quietly run on the pool.
+func TestWritesNeedTransaction(t *testing.T) {
 	r := repository.New(testdb.Pool(t))
-	ctx := context.Background()
-	at := func(dealership, serviceType, vehicle, bay, tech string, hour int) model.Appointment {
-		start := time.Date(2026, 10, 21, hour, 0, 0, 0, time.UTC)
-		return model.Appointment{
-			DealershipID: dealership, CustomerID: "C1", VehicleID: vehicle, ServiceTypeID: serviceType,
-			BayID: bay, TechnicianID: tech, Start: start, End: start.Add(30 * time.Minute),
-			Status: model.StatusConfirmed,
-		}
-	}
-	errs := make(chan error, 2)
-	run := func(first, second model.Appointment, mine, theirs chan struct{}) {
-		errs <- r.InTx(ctx, func(ctx context.Context) error {
-			if _, err := r.InsertAppointment(ctx, first); err != nil {
-				return err
-			}
-			close(mine)
-			<-theirs
-			_, err := r.InsertAppointment(ctx, second) // waits on the other's first row
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	calls := map[string]func(context.Context) error{
+		"LockDealership": func(ctx context.Context) error { return r.LockDealership(ctx, "DL1") },
+		"LockVehicle":    func(ctx context.Context) error { return r.LockVehicle(ctx, "V1") },
+		"ClaimKey": func(ctx context.Context) error {
+			_, err := r.ClaimKey(ctx, "key", "hash", now)
 			return err
+		},
+		"SaveKeyOutcome": func(ctx context.Context) error {
+			return r.SaveKeyOutcome(ctx, "key", model.Outcome{})
+		},
+		"InsertAppointment": func(ctx context.Context) error {
+			_, err := r.InsertAppointment(ctx, model.Appointment{})
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			err := call(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "no transaction in context") {
+				t.Errorf("outside InTx = %v, want a no-transaction error", err)
+			}
 		})
 	}
-	a, b := make(chan struct{}), make(chan struct{})
-	go run(at("DL1", "OIL", "V1", "B1", "T1", 2), at("DL1", "OIL", "V2", "B2", "T2", 3), a, b)
-	go run(at("DL2", "TIRE", "V2", "B3", "T4", 3), at("DL2", "TIRE", "V1", "B3", "T4", 2), b, a)
-
-	var deadlocked, ok int
-	for range 2 {
-		switch err := <-errs; {
-		case err == nil:
-			ok++
-		case errors.Is(err, model.ErrDeadlock):
-			deadlocked++
-		default:
-			t.Errorf("err = %v, want nil or model.ErrDeadlock", err)
+	// Inside InTx the same ctx works, here for the two that need no setup.
+	for _, name := range []string{"LockDealership", "LockVehicle"} {
+		if err := r.InTx(context.Background(), calls[name]); err != nil {
+			t.Errorf("%s inside InTx: %v", name, err)
 		}
-	}
-	if ok != 1 || deadlocked != 1 {
-		t.Errorf("%d committed, %d deadlocked; want 1 and 1", ok, deadlocked)
 	}
 }
 
-// Outside a transaction the advisory lock would be released as soon as it was taken, so the
-// call must fail rather than silently not lock.
-func TestLockDealershipNeedsTransaction(t *testing.T) {
-	r := repository.New(testdb.Pool(t))
-	if err := r.LockDealership(context.Background(), "DL1"); err == nil {
-		t.Fatal("LockDealership outside InTx returned nil, want an error")
+// Behind a transaction-mode pooler, the next client of a connection never sees a statement a
+// previous one prepared by name. After queries run twice (past any cache threshold) the
+// connection holds no named prepared statement.
+func TestConnectPreparesNoNamedStatements(t *testing.T) {
+	ctx := context.Background()
+	pool, err := repository.Connect(ctx, testdb.Pool(t).Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := r.InTx(context.Background(), func(ctx context.Context) error {
-		return r.LockDealership(ctx, "DL1")
-	}); err != nil {
-		t.Fatalf("LockDealership inside InTx: %v", err)
+	t.Cleanup(pool.Close)
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	for range 3 {
+		var n int
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM bays WHERE dealership_id = $1`, "DL1").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var named int
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM pg_prepared_statements`).Scan(&named); err != nil {
+		t.Fatal(err)
+	}
+	if named != 0 {
+		t.Errorf("%d named prepared statement(s) on the connection, want 0", named)
 	}
 }
