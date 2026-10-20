@@ -31,7 +31,7 @@ Everything in this table is an assumption. Each one is justified by a decision i
 | Technician | exists; must be available and **qualified** | belongs to one dealership; has `skills[]`; has a working window per day, intersected with the dealership's opening hours | D3, D4 |
 | ServiceType | exists; has a **duration** (implied by "entire service duration") | belongs to one dealership; has one `required_skill` | D3 |
 | Customer | exists; appears in the Appointment record | has many vehicles | D11 |
-| Vehicle | exists; a booking targets one | belongs to one customer; the booking carries the vehicle, the customer is derived from it | D11 |
+| Vehicle | exists; a booking targets one | belongs to one customer, not to a dealership; the booking carries the vehicle, the customer is derived from it | D11 |
 | Appointment | persisted; links customer, vehicle, technician, bay | also stores service type, dealership, `start`, `end`, `status` | D10 |
 | User | "a user" requests a booking; not defined | whoever calls the API — a service advisor or a customer-facing client. The API does not distinguish; authentication is out of scope | §3 |
 
@@ -60,7 +60,7 @@ From the "backend" option:
 | B1 | RESTful API | D9 |
 | B2 | Persistent database | D8, D11 |
 | B3 | Client layer mocked: OpenAPI spec + cURL examples | `openapi.yaml`, README |
-| B4 | Tests that validate core business logic | spec examples → table-driven tests; one concurrency integration test |
+| B4 | Tests that validate core business logic | spec examples → table-driven tests; concurrency integration tests on Postgres |
 | B5 | Consider scalability, performance, reliability, maintainability, observability | D8, D12, D13, design doc §7–8 |
 
 ---
@@ -83,7 +83,7 @@ From the "backend" option:
 - **Considered:** multiple required skills per service — deferred; the matching rule generalises to "technician has all required skills" without changing the API.
 
 ### D4 — Technician
-- **What:** belongs to one dealership; has `skills[]` (FK to `skills`) and one working window per day (same shape as D2). The effective window is the intersection with the dealership's opening hours.
+- **What:** belongs to one dealership; has `skills[]` (FK to `skills`) and one working window per day (same shape as D2). The effective window is the intersection with the dealership's opening hours, and it is checked at booking: a technician is only a candidate if `[start, end)` lies inside it.
 - **Why:** minimum needed for qualification + availability.
 - **Considered:** shifts, breaks, leave — deferred; see "technician unavailable mid-day" in §3.
 
@@ -98,36 +98,44 @@ From the "backend" option:
 - **Considered:** buffer time between appointments — deferred; would be `end + buffer` in the same rule.
 
 ### D7 — Assignment
-- **What:** the system picks the first available bay and the first available **qualified** technician, in deterministic order (by id). The caller does not choose resources.
+- **What:** the system picks the first available bay and the first available **qualified** technician, in deterministic order (by id). Candidates are only bays and technicians of the request's `dealership_id`. The caller does not choose resources.
 - **Why:** R1 says the user requests a *time*, not a bay or a technician. Deterministic order makes tests and the demo predictable.
 - **Considered:** load balancing, preferred technician — deferred; assignment is one function and can be swapped.
 
 ### D8 — Concurrency & correctness
-- **What:** booking runs in one DB transaction. The application checks availability first (to produce a clear 409 reason), then inserts. Postgres **exclusion constraints** on `(bay_id, tstzrange(start, end))`, `(technician_id, tstzrange(start, end))` and `(vehicle_id, tstzrange(start, end))`, partial `WHERE status = 'confirmed'`, are the final guard. On a constraint violation the booking retries with the next candidate in a new transaction, max 3 attempts, then 409.
+- **What:** booking runs in one DB transaction. The application checks availability first (to produce a clear 409 reason), then inserts. Postgres **exclusion constraints** on `(bay_id, tstzrange(start, end))`, `(technician_id, tstzrange(start, end))` and `(vehicle_id, tstzrange(start, end))`, partial `WHERE status = 'confirmed'`, are the final guard. On a bay or technician constraint violation the booking retries in a new transaction, re-running the full check, max 3 attempts; after 3 lost races → 503 with `Retry-After`, nothing stored, the caller retries with the same key. A vehicle constraint violation → 409 `vehicle_busy` immediately, no retry (another candidate cannot fix it).
 - **Why:** check-then-insert is a race; two concurrent requests can both pass the check. The database is the only place that can serialise correctly. The app-level check exists for a good error message, not for correctness.
 - **Considered:** `SELECT ... FOR UPDATE` on resource rows — works, but the exclusion constraint is declarative and cannot be bypassed by a future code path. Application-level mutex — rejected, breaks with more than one instance.
 
 ### D9 — API
 - **What:**
-  - `POST /appointments` → 201 with the appointment; 409 `{reason, message}` when no bay / no qualified technician; 422 when outside hours, `start` not aligned to 15 min, or a referenced id does not belong to `dealership_id`; 400 on malformed input; 404 on unknown references.
+  - `POST /appointments` → 201 with the appointment; 409 `{reason, message}` when the current state blocks the booking; 422 when outside hours, `start` not aligned to 15 min, `start` not in the future, or the service type does not belong to `dealership_id`; 400 on malformed input (missing field, wrong type or format, empty or null id, `start` without offset, `Idempotency-Key` not a UUID); 404 on well-formed but unknown references, naming the first unknown in the order dealership, vehicle, service type. Unknown body fields are ignored.
+  - Checks run in this order: 400 → idempotency key lookup → 404 → 422 → 409.
+  - 409 reasons, checked in this order, first failure wins: `vehicle_busy` (the vehicle has an overlapping appointment), `no_bay`, `no_technician` (no qualified technician free). Bay and technician both busy → `no_bay`.
   - `GET /appointments/{id}`
-  - `GET /availability?dealership_id&service_type_id&date` → list of bookable start times. `date` is a local date in the dealership's timezone.
-  - `POST /appointments` accepts an `Idempotency-Key` header. Keys are stored in an `idempotency_keys` table (`key` PK, `request_hash`, `status`, `body`, `created_at`); the key is inserted first, inside the booking transaction. Same key + same payload → same appointment, same response: the stored response is replayed, including a 409. A concurrent request with the same key waits for the first, then replays. Same key + different payload → 422. Keys expire after 24 h.
+  - `GET /availability?dealership_id&service_type_id&date` → list of bookable start times: every 15-min-aligned `start` inside opening hours where at least one bay and one qualified technician of the dealership are free for the whole `[start, end)` (D4, D6), and `start > now`. The vehicle is not considered. `date` is a local date in the dealership's timezone. A past date → empty list, 200.
+  - `POST /appointments` accepts an `Idempotency-Key` header: a client-generated UUID, global (not scoped to dealership or customer); a collision is a client bug. Keys are stored in an `idempotency_keys` table (`key` PK, `request_hash`, `status`, `body`, `created_at`).
+    - The key row is inserted first, inside the booking transaction; the response is written to the key row before commit, so the key row and the appointment commit together. A 409 commits the key row alone. 400/404/422 store nothing.
+    - `request_hash` = hash of the canonical JSON of the four schema fields (`dealership_id, vehicle_id, service_type_id, start`), `start` normalised to UTC. Unknown fields, key order and whitespace do not count.
+    - Same key + same hash → the stored response is replayed, including a 409. Same key + different hash → 422.
+    - A concurrent request with the same key blocks on the key row's lock until the first commits or rolls back. Commit → it replays or gets 422 (this also covers same key + different payload at the same moment). Rollback (500, timeout, 503) → the key row is gone and the waiting request runs as new.
+    - A key row older than 24 h is treated as absent and overwritten.
+    - `X-Request-ID` on any response, including a replay, is the current request's.
 - **Why:** availability is what a real client needs before it can offer the user a time. 409 reasons are machine-readable so a UI can react. Idempotency makes retries safe (mobile clients, timeouts).
 - **Considered:** returning alternative slots in the 409 body — stretch goal, not required.
 
 ### D10 — Appointment record
-- **What:** stores `dealership_id, customer_id, vehicle_id, service_type_id, bay_id, technician_id, start, end, status`. `status` is always `confirmed` in this scope.
+- **What:** stores `dealership_id, customer_id, vehicle_id, service_type_id, bay_id, technician_id, start, end, status`. `status` is always `confirmed` in this scope. `customer_id` is copied from the vehicle's owner at booking time and does not follow later ownership changes.
 - **Why:** exactly R3, plus `end` denormalised so the booked interval does not move if the service type's duration is edited later.
 - **Considered:** `pending` state with later confirmation — rejected; the scenario says check, then confirm, in one step.
 
 ### D11 — Reference data & persistence
-- **What:** dealerships, bays, technicians, service types, customers, vehicles are reference data loaded by a seed script. No CRUD endpoints for them. The request carries `vehicle_id`; `customer_id` is derived from the vehicle and still stored on the appointment. All referenced ids must belong to `dealership_id`, else 422.
+- **What:** dealerships, bays, technicians, service types, customers, vehicles are reference data loaded by a seed script. No CRUD endpoints for them. The request carries `vehicle_id`; `customer_id` is derived from the vehicle and still stored on the appointment (D10). Every vehicle has an owner (`vehicles.customer_id NOT NULL`). Vehicles belong to customers, not dealerships: any vehicle can be booked at any dealership. Only the service type, bay and technician must belong to `dealership_id`; the service type is checked (else 422), bays and technicians are only ever picked from that dealership (D7).
 - **Why:** the scenario is about booking, not managing the dealership. Seeding keeps the demo and tests on the same data.
 - **Considered:** carrying `customer_id` in the request — rejected; it only adds a mismatch failure mode.
 
 ### D12 — Reliability
-- **What:** stateless service; all state in Postgres. Idempotent writes. Timeouts on DB calls. Graceful shutdown.
+- **What:** stateless service; all state in Postgres. Idempotent writes. Timeouts on DB calls. Graceful shutdown. `now` comes from an injected clock; tests fix it and never read the wall clock.
 - **Why:** so more than one instance can run behind a load balancer without coordination.
 
 ### D13 — Observability
@@ -144,8 +152,11 @@ From the "backend" option:
 | Cancel / reschedule | Not required; adds state transitions | `DELETE /appointments/{id}` sets `status=cancelled`; constraints already only consider `confirmed` |
 | Notifications | Different concern, different system | Publish `AppointmentConfirmed` event; consumer sends SMS/email |
 | Authentication / authorisation | Not required; would hide the booking logic behind setup | Gateway-level JWT; `dealership_id` from token, not from body |
+| Idempotency key scoped per customer | Needs authentication to know the customer | Scope the key to the authenticated caller |
+| Retry after key expiry | A retry of a successful booking more than 24 h later gets 409 `vehicle_busy`, though the booking exists | On `vehicle_busy`, return the existing appointment if it matches the payload |
 | Multi-tenant isolation beyond `dealership_id` | One schema is fine at this size | Row-level security or schema-per-tenant once a tenant is large |
 | Technician leave / sickness mid-day | Operational reality, but a separate feature | `technician_unavailability` table joined into the availability rule; existing appointments flagged for rebooking |
+| DST tests | The seed timezone has no DST; the IANA tz library handles it | Add a dealership in a DST zone and test the change days |
 | Per-weekday hours, holidays, lunch breaks | Calendar modelling | Replace single window with a calendar table; rule stays the same |
 | Bay types, multiple skills, buffer time | Extensions of existing rules | See D3, D5, D6 |
 | Smarter technician assignment | Optimisation. Cost of D7: first-by-id can put the only technician with a rare skill on a job anyone could do, so a later booking that would have fit gets a 409 | Prefer the least-specialised qualified technician |
@@ -156,10 +167,10 @@ From the "backend" option:
 
 ## 4. Open questions (to resolve in the spec)
 
-- Lower bound: can a booking be in the past? → proposed: no, `start > now`.
-- Upper bound: how far ahead? → proposed: no limit in scope.
-- Same vehicle, overlapping appointments? → proposed: reject, a car cannot be in two bays. Enforced by the `(vehicle_id, range)` exclusion constraint (D8).
-- `GET /availability` when the date is closed / in the past → proposed: empty list, 200.
+- ~~Lower bound: can a booking be in the past?~~ → resolved: no, `start > now`, else 422 (D9).
+- ~~Upper bound: how far ahead?~~ → resolved: no upper bound.
+- ~~Same vehicle, overlapping appointments?~~ → resolved: reject with 409 `vehicle_busy`, across dealerships too. Enforced by the `(vehicle_id, range)` exclusion constraint (D8).
+- ~~`GET /availability` when the date is in the past?~~ → resolved: empty list, 200 (D9). There are no closed dates (D2).
 
 ---
 
@@ -178,10 +189,34 @@ From the "backend" option:
 | 7 | carrying `customer_id` adds a mismatch failure mode for no benefit | changed: dropped from request, derived from vehicle, still stored | vehicle already determines the customer |
 | 8 | reason for denormalised `end` was weak | changed: booked interval must not move if duration is edited later | the stronger, correctness reason |
 | 9 | "future in dealership local time" is meaningless; now is an instant | changed: `start > now` | timezone only matters for hours and dates |
-| 10 | constraint violation on candidate 1 returns 409 while candidate 2 is free | changed: retry with next candidate in a new tx, max 3, then 409 | avoids false 409s under concurrency |
+| 10 | constraint violation on candidate 1 returns 409 while candidate 2 is free | changed: retry with next candidate in a new tx, max 3, then 409 (superseded by §6 #6: 503) | avoids false 409s under concurrency |
 | 11 | idempotency storage, scope, TTL, concurrent same key, replayed 409 undefined | changed: `idempotency_keys` table (key PK, request_hash, status, body, created_at), key inserted first in tx, same key waits then replays incl. 409, different hash 422, TTL 24 h | PK serialises same-key requests; stored response makes replays exact |
 | 12 | durations and hours not required to be multiples of 15 | changed: check constraints, duration and hours multiples of 15 | keeps D1's slot grid valid |
 | 13 | `date` in `GET /availability` local or UTC undefined | changed: dealership local date | DST days stay correct |
 | 14 | free-text skills: one typo means no qualified technician, silently | changed: `skills` reference table + FK | typos fail at write time |
 | 15 | references from another dealership not handled | changed: all referenced ids must belong to `dealership_id`, else 422 | no cross-dealership bookings |
 | 16 | `dealership_id` unknown on `GET /appointments/{id}` before lookup | changed: `dealership_id` in logs when known | field is honest, not empty |
+
+---
+
+## 6. Spec review log
+
+*Filled while turning the cases into the booking spec. Same format as §5.*
+
+| # | Point | Verdict | Why |
+|---|---|---|---|
+| 1 | 409 reason when bay and technician are both busy undefined | changed: order bay → technician, both busy → `no_bay` | one deterministic reason per state |
+| 2 | vehicle overlap had no 409 reason | changed: `vehicle_busy` as third reason, checked first | the caller's own car is the blocker, not the workshop |
+| 3 | §5 #15 required the vehicle to belong to the dealership, but vehicles belong to customers | changed: only service type, bay, technician are dealership-scoped | a customer can take a car to any dealership |
+| 4 | unknown body fields (e.g. `bay_id`) undefined | changed: ignored | the caller does not choose resources (D7) |
+| 5 | candidates could come from another dealership | changed: bays and technicians filtered by `dealership_id` (D7) | the request names one dealership |
+| 6 | outcome after 3 lost races undefined | changed: 503 + `Retry-After`, nothing stored (D8) | not a state conflict; a retry with the same key can succeed |
+| 7 | vehicle constraint violation retried pointlessly | changed: 409 `vehicle_busy` immediately (D8) | no other candidate can fix it |
+| 8 | key row and appointment could be written apart | changed: one transaction, response on key row before commit; rollback removes the key row (D9) | no booking without its key |
+| 9 | key scope, payload equality, expiry and request id on replay undefined | changed: global client UUID; hash of 4 canonical fields, `start` in UTC; >24 h treated as absent; current `X-Request-ID` (D9) | each retry case has one answer |
+| 10 | check order with an existing key unclear | changed: 400 → key lookup → 404 → 422 → 409 (D9) | a replay must not fail validation that passed the first time |
+| 11 | technician hours not stated as checked | changed: checked at booking (D4) | the seed has a short shift |
+| 12 | 400 vs 404 for edge inputs; which unknown the 404 names | changed: wrong type/format 400, well-formed unknown 404, first unknown in order dealership, vehicle, service type (D9) | deterministic error per input |
+| 13 | `customer_id` live or copied | changed: copied at booking; vehicle owner NOT NULL (D10, D11) | the record does not change after the fact |
+| 14 | "closed date" in availability has no meaning (D2) | changed: line dropped, past date → empty list | no calendar in scope |
+| 15 | no upper bound on `start`; DST | kept: no upper bound; DST left to the IANA tz library, no DST tests | out of scope |
