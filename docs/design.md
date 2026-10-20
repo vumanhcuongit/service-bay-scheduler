@@ -67,7 +67,7 @@ The request-id middleware (★, highlighted) is the outermost layer, so every lo
 
 **Clock.** One interface, `Now()`. Production uses the wall clock; tests fix it (D12). Nothing else in the code calls `time.Now()`.
 
-**Repository.** Runs SQL, owns transaction start/commit/rollback, and translates constraint violations into the typed errors above by constraint name. It must not know the business rules: it doesn't decide which bay comes first or which 409 reason wins; it only returns rows and errors.
+**Repository.** Runs SQL, owns transaction start/commit/rollback, and translates constraint violations into the typed errors above by constraint name. It must not know the business rules: it doesn't decide which bay comes first or which 409 reason wins; it only returns rows and errors. The transaction travels in the context, so the repository need not import the service package that declares its interface. The cost: a call made with the wrong context runs outside the transaction. Mitigation: `InTx` is the only place a transaction starts, and the spec tests run every path inside one.
 
 **Postgres.** Holds all state. Its exclusion constraints are the last word on overlaps (§5).
 
