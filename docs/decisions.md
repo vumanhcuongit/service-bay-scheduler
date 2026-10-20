@@ -122,6 +122,12 @@ From the "backend" option:
     - A concurrent request with the same key blocks on the key row's lock until the first commits or rolls back. Commit → it replays or gets 422 (this also covers same key + different payload at the same moment). Rollback (500, timeout, 503) → the key row is gone and the waiting request runs as new.
     - A key row older than 24 h is treated as absent and overwritten. A periodic job deletes rows older than 24 h, so the table does not grow without bound. It runs as a scheduled task outside the service (ECS scheduled task or cron; locally a make target), not as a loop in each instance, which would run it once per instance.
     - `X-Request-ID` on any response, including a replay, is the current request's.
+  - Input rules, from red-team pass 2:
+    - Ids are exact, case-sensitive strings: `" V1"` and `"v1"` are unknown ids, not `V1`.
+    - Duplicate JSON keys are out of scope: the last one wins.
+    - `Idempotency-Key` must be the hyphenated UUID form, in any case. Braces, no hyphens and `urn:uuid:` forms are a 400, and so is an empty header. The nil UUID is allowed.
+    - A lowercase `t` or `z` in `start` is a 400.
+    - `X-Request-ID` is used as given only if it matches `[A-Za-z0-9._-]{1,128}`; otherwise it is replaced with a generated one (as in `openapi.yaml`).
 - **Why:** availability is what a real client needs before it can offer the user a time. 409 reasons are machine-readable so a UI can react. Idempotency makes retries safe (mobile clients, timeouts).
 - **Considered:** returning alternative slots in the 409 body — stretch goal, not required.
 
