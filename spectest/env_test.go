@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -64,15 +65,17 @@ func dealership(id string) opt { return func(r *request) { r.dealership = id } }
 
 func dl2() opt { return dealership("DL2") }
 
-// startAt turns "09:00" or "09:00:30" into Day local time; anything longer is used as given.
+var clockTime = regexp.MustCompile(`^\d\d:\d\d(:\d\d)?$`)
+
+// startAt turns "09:00" or "09:00:30" into Day local time; anything else is used as given.
 func startAt(at string) string {
-	switch len(at) {
-	case 5:
+	switch {
+	case !clockTime.MatchString(at):
+		return at
+	case len(at) == 5:
 		return day + "T" + at + ":00+07:00"
-	case 8:
-		return day + "T" + at + "+07:00"
 	}
-	return at
+	return day + "T" + at + "+07:00"
 }
 
 // book is the spec's book(V, S, t): POST /appointments for DL1 unless dl2() is given.
@@ -204,5 +207,18 @@ func expect[T comparable](t *testing.T, name string, got, want T) {
 	t.Helper()
 	if got != want {
 		t.Errorf("%s = %v, want %v", name, got, want)
+	}
+}
+
+// TestStartAt guards the helper itself: only HH:MM and HH:MM:SS are expanded, so N29's
+// "tomorrow" (8 characters, like "09:00:30") reaches the service as sent.
+func TestStartAt(t *testing.T) {
+	for in, want := range map[string]string{
+		"09:00":            "2026-10-21T09:00:00+07:00",
+		"09:00:30":         "2026-10-21T09:00:30+07:00",
+		"tomorrow":         "tomorrow",
+		"2026-10-21T09:00": "2026-10-21T09:00",
+	} {
+		expect(t, "startAt("+in+")", startAt(in), want)
 	}
 }
