@@ -39,7 +39,6 @@ func New(svc *service.Service, log *slog.Logger, cfg Config) http.Handler {
 }
 
 func (h *handler) handleCreateAppointment(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	req, err := decodeBookingRequest(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

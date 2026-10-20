@@ -12,7 +12,7 @@ import (
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 )
 
-// maxBodyBytes caps a booking body; handleCreateAppointment applies it with http.MaxBytesReader.
+// maxBodyBytes caps a booking body.
 const maxBodyBytes = 1 << 20
 
 // startLayouts are tried in order. The second takes a start without seconds, e.g. 2026-10-21T02:00Z (M10).
@@ -27,7 +27,7 @@ func isUUID(s string) bool { return uuidPattern.MatchString(s) }
 // non-empty string; unknown fields are ignored (D9). An error is a 400 naming the field.
 func decodeBookingRequest(r *http.Request) (model.BookingRequest, error) {
 	var fields map[string]json.RawMessage
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBodyBytes))
 	if err := dec.Decode(&fields); err != nil || fields == nil {
 		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
 			return model.BookingRequest{}, fmt.Errorf("body must be at most %d bytes", tooLarge.Limit)
