@@ -35,19 +35,14 @@ type env struct {
 }
 
 // newEnv runs everything inside one transaction that is rolled back when the test ends.
+// Task 7 adds newEnvWith (wrapped repository) and newPoolEnv (real commits).
 func newEnv(t *testing.T) *env {
-	return newEnvOn(t, testdb.Tx(t), nil)
-}
-
-func newEnvOn(t *testing.T, db repository.DB, wrap func(service.Repository) service.Repository) *env {
 	t.Helper()
-	var repo service.Repository = repository.New(db)
-	if wrap != nil {
-		repo = wrap(repo)
-	}
+	db := testdb.Tx(t)
 	clk := clock.NewFixed(defaultNow)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return &env{t: t, h: handler.New(service.New(repo, clk, log), log, handler.Config{}), clock: clk, db: db}
+	svc := service.New(repository.New(db), clk, log)
+	return &env{t: t, h: handler.New(svc, log, handler.Config{}), clock: clk, db: db}
 }
 
 type request struct {
