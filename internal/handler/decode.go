@@ -108,24 +108,28 @@ type availabilityQuery struct {
 	Date time.Time
 }
 
-// decodeAvailabilityQuery reads the three required query parameters. An error is a 400 naming one.
+// decodeAvailabilityQuery reads the three required query parameters, each given once. An error
+// is a 400 naming one.
 func decodeAvailabilityQuery(r *http.Request) (availabilityQuery, error) {
 	v := r.URL.Query()
 	var q availabilityQuery
+	var date string
 	for _, f := range []struct {
 		name string
 		dst  *string
 	}{
 		{"dealership_id", &q.DealershipID},
 		{"service_type_id", &q.ServiceTypeID},
+		{"date", &date},
 	} {
-		if *f.dst = v.Get(f.name); *f.dst == "" {
+		switch vals := v[f.name]; {
+		case len(vals) > 1:
+			return availabilityQuery{}, fmt.Errorf("%s must be given once", f.name)
+		case len(vals) == 0 || vals[0] == "":
 			return availabilityQuery{}, fmt.Errorf("%s is required", f.name)
+		default:
+			*f.dst = vals[0]
 		}
-	}
-	date := v.Get("date")
-	if date == "" {
-		return availabilityQuery{}, errors.New("date is required")
 	}
 	var err error
 	if q.Date, err = time.Parse(time.DateOnly, date); err != nil {
