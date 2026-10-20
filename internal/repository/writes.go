@@ -56,8 +56,13 @@ func isCode(err error, code string) bool {
 }
 
 // InsertAppointment maps an exclusion violation or deadlock to the error the service sees.
-// The constraints stay the guard; LockDealership only keeps them from racing (D8).
+// The constraints stay the guard; LockDealership only keeps them from racing (D8). Its row wait
+// is the one that can deadlock (the same vehicle at two dealerships), so it first raises
+// lock_timeout above deadlock_timeout, letting the detector abort one side, not both.
 func (r *Repository) InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error) {
+	if _, err := r.q(ctx).Exec(ctx, `SET LOCAL lock_timeout = '`+insertLockTimeout+`'`); err != nil {
+		return model.Appointment{}, fmt.Errorf("set insert lock_timeout: %w", err)
+	}
 	err := r.q(ctx).QueryRow(ctx, `
 		INSERT INTO appointments
 			(dealership_id, customer_id, vehicle_id, service_type_id, bay_id, technician_id, start, "end", status)

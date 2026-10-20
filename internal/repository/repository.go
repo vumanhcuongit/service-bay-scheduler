@@ -48,9 +48,15 @@ func (r *Repository) q(ctx context.Context) DB {
 	return r.db
 }
 
-// lockTimeout bounds each lock wait in a transaction (the key row, the dealership lock, a row
-// an insert waits on), so a wait gives a 503 instead of running into the request deadline (D8).
-const lockTimeout = "1s"
+// lockTimeout bounds each lock wait in a transaction, so a wait gives a 503 instead of running
+// into the request deadline (D8). It is right for the key row and the dealership lock, which
+// cannot deadlock: the key always comes first. A wait that can deadlock must allow longer than
+// Postgres's deadlock_timeout (1 s by default, superuser-only), or the detector never picks a
+// victim and both sides time out; InsertAppointment raises it to insertLockTimeout.
+const (
+	lockTimeout       = "1s"
+	insertLockTimeout = "2s"
+)
 
 // InTx is the only place a transaction starts. Inside an existing one it opens a savepoint.
 // Its first statement sets lock_timeout, before any call in fn can wait on a lock.
