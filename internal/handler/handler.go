@@ -79,9 +79,12 @@ func writeOutcome(w http.ResponseWriter, o model.Outcome) {
 
 func (h *handler) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 	var notFound *model.NotFoundError
+	var invalid *model.InvalidError
 	switch {
 	case errors.As(err, &notFound):
 		writeError(w, http.StatusNotFound, notFound.Error())
+	case errors.As(err, &invalid):
+		writeError(w, http.StatusUnprocessableEntity, invalid.Error())
 	default:
 		h.log.ErrorContext(r.Context(), "request failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 )
@@ -46,6 +47,9 @@ func (s *Service) attempt(ctx context.Context, req model.BookingRequest) (model.
 	st, err := s.repo.GetServiceType(ctx, req.ServiceTypeID)
 	if err != nil {
 		return model.Outcome{}, notFound(err, "service type", req.ServiceTypeID)
+	}
+	if err := checkRules(d, st, req.Start, s.clock.Now()); err != nil {
+		return model.Outcome{}, err
 	}
 
 	w := model.Interval{Start: req.Start, End: req.Start.Add(st.Duration)}
@@ -103,6 +107,32 @@ func (s *Service) GetAppointment(ctx context.Context, id string) (model.Appointm
 		return model.Appointment{}, notFound(err, "appointment", id)
 	}
 	return a, nil
+}
+
+// checkRules runs the 422 checks in order: grid, future, service type offered here, opening hours.
+func checkRules(d model.Dealership, st model.ServiceType, start, now time.Time) error {
+	local := start.In(d.Location)
+	switch {
+	case !model.IsAligned(start):
+		return invalid("start %s is not on the 15-minute grid", local.Format(time.RFC3339Nano))
+	case !start.After(now):
+		return invalid("start %s is not in the future", local.Format(time.RFC3339))
+	case st.DealershipID != d.ID:
+		return invalid("service type %s is not offered by dealership %s", st.ID, d.ID)
+	}
+	opening, closing := model.LocalWindow(d.Location, start, d.Open, d.Close)
+	end := start.Add(st.Duration)
+	switch {
+	case start.Before(opening):
+		return invalid("appointment would start at %s, before opening at %s", local.Format("15:04"), opening.Format("15:04"))
+	case end.After(closing):
+		return invalid("appointment would end at %s, after closing at %s", end.In(d.Location).Format("15:04"), closing.Format("15:04"))
+	}
+	return nil
+}
+
+func invalid(format string, args ...any) error {
+	return &model.InvalidError{Message: fmt.Sprintf(format, args...)}
 }
 
 func conflict(r model.Reason, msg string) model.Outcome {

@@ -59,8 +59,10 @@ func extra(m map[string]any) opt { return func(r *request) { r.extra = m } }
 // raw sends body as is, in place of the four fields.
 func raw(body string) opt { return func(r *request) { r.raw = &body } }
 
-// dealership books at id instead of DL1.
+// dealership books at id instead of DL1; dl2 is the spec's book@DL2.
 func dealership(id string) opt { return func(r *request) { r.dealership = id } }
+
+func dl2() opt { return dealership("DL2") }
 
 // startAt turns "09:00" or "09:00:30" into Day local time; anything longer is used as given.
 func startAt(at string) string {
@@ -168,6 +170,21 @@ func (e *env) status(r *httptest.ResponseRecorder, code int) {
 	e.t.Helper()
 	if r.Code != code {
 		e.t.Fatalf("status %d, want %d; body %s", r.Code, code, r.Body.String())
+	}
+}
+
+// conflict asserts a 409 with reason.
+func (e *env) conflict(r *httptest.ResponseRecorder, reason string) {
+	e.t.Helper()
+	e.status(r, http.StatusConflict)
+	var b struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(r.Body.Bytes(), &b); err != nil {
+		e.t.Fatalf("decode 409 body %q: %v", r.Body.String(), err)
+	}
+	if b.Reason != reason {
+		e.t.Fatalf("reason %q, want %q; body %s", b.Reason, reason, r.Body.String())
 	}
 }
 
