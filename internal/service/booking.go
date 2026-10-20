@@ -34,7 +34,7 @@ func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string
 	return out, err
 }
 
-// attempt runs one booking transaction body: 404 → 409 → insert.
+// attempt runs one booking transaction body: 404 → 422 → 409 → insert (D9).
 func (s *Service) attempt(ctx context.Context, req model.BookingRequest) (model.Outcome, error) {
 	d, err := s.repo.GetDealership(ctx, req.DealershipID)
 	if err != nil {
@@ -109,7 +109,7 @@ func (s *Service) GetAppointment(ctx context.Context, id string) (model.Appointm
 	return a, nil
 }
 
-// checkRules runs the 422 checks in order: grid, future, service type offered here, opening hours.
+// checkRules runs the 422 checks in the D9 order: grid, future, service type offered here, opening hours.
 func checkRules(d model.Dealership, st model.ServiceType, start, now time.Time) error {
 	local := start.In(d.Location)
 	switch {
