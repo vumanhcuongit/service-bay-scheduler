@@ -65,6 +65,11 @@ func dealership(id string) opt { return func(r *request) { r.dealership = id } }
 
 func dl2() opt { return dealership("DL2") }
 
+// key sends k as the Idempotency-Key; rid sends id as the X-Request-ID.
+func key(k string) opt { return func(r *request) { r.key = k } }
+
+func rid(id string) opt { return func(r *request) { r.rid = id } }
+
 var clockTime = regexp.MustCompile(`^\d\d:\d\d(:\d\d)?$`)
 
 // startAt turns "09:00" or "09:00:30" into Day local time; anything else is used as given.
@@ -201,6 +206,16 @@ func (e *env) message(r *httptest.ResponseRecorder) string {
 		e.t.Fatalf("decode error body %q: %v", r.Body.String(), err)
 	}
 	return b.Message
+}
+
+// count runs a SELECT count(*) query.
+func (e *env) count(query string, args ...any) int {
+	e.t.Helper()
+	var n int
+	if err := e.db.QueryRow(context.Background(), query, args...).Scan(&n); err != nil {
+		e.t.Fatalf("%s: %v", query, err)
+	}
+	return n
 }
 
 func expect[T comparable](t *testing.T, name string, got, want T) {

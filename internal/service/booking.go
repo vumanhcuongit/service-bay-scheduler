@@ -23,13 +23,35 @@ func New(r Repository, c model.Clock, l *slog.Logger) *Service {
 }
 
 // Book books req, assigning the first free bay and qualified technician (D7).
-// key is the Idempotency-Key, "" for none. A 409 is an Outcome, not an error.
+// key is the Idempotency-Key, "" for none; it is claimed before any other check, so a stored
+// outcome replays without them (D9). A 409 is an Outcome, not an error.
 func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
 	var out model.Outcome
 	err := s.repo.InTx(ctx, func(ctx context.Context) error {
+		if key != "" {
+			hash := model.HashRequest(req)
+			stored, err := s.repo.ClaimKey(ctx, key, hash, s.clock.Now())
+			if err != nil {
+				return err
+			}
+			if stored != nil {
+				if stored.Hash != hash {
+					return invalid("Idempotency-Key reused with a different payload")
+				}
+				out = stored.Outcome
+				out.Replayed = true
+				return nil
+			}
+		}
 		var err error
-		out, err = s.attempt(ctx, req)
-		return err
+		if out, err = s.attempt(ctx, req); err != nil {
+			return err
+		}
+		if key != "" {
+			// Same transaction as the appointment, so the key row and the booking commit together.
+			return s.repo.SaveKeyOutcome(ctx, key, out)
+		}
+		return nil
 	})
 	return out, err
 }
