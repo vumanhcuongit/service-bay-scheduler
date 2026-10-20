@@ -23,22 +23,38 @@ func New(r Repository, c model.Clock, l *slog.Logger) *Service {
 	return &Service{repo: r, clock: c, log: l}
 }
 
-// maxAttempts bounds the transactions one booking runs after losing races; before each retry
-// it waits minBackoff plus up to minBackoff more, at random (D8).
-const (
-	maxAttempts = 3
-	minBackoff  = 50 * time.Millisecond
-)
+// minBackoff is the wait before the one re-run: minBackoff plus up to minBackoff more, at random (D8).
+const minBackoff = 50 * time.Millisecond
 
 // Book books req, assigning the first free bay and qualified technician (D7).
 // key is the Idempotency-Key, "" for none; it is claimed before any other check, so a stored
-// outcome replays without them (D9). A 409 is an Outcome, not an error. A lost race for a bay
-// or technician retries with a fresh check, at most maxAttempts in total, then ErrUnavailable (D8).
-// Each booking logs one decision line (D13).
+// outcome replays without them (D9). After the 404 and 422 checks the dealership is locked, so
+// its availability reads and inserts run one booking at a time. A 409 is an Outcome, not an
+// error. A constraint violation or deadlock, which the lock leaves only to the same vehicle at
+// two dealerships, gets one re-run, then ErrUnavailable. A wait cut short, by the lock timeout
+// or by ctx's deadline, is ErrUnavailable at once (D8). Each booking logs one decision line (D13).
 func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
 	out, err := s.book(ctx, req, key)
+	switch {
+	case errors.Is(err, model.ErrLockTimeout):
+		err = fmt.Errorf("%w: %w", model.ErrUnavailable, err)
+	case err != nil && !errors.Is(err, model.ErrUnavailable) && errors.Is(ctx.Err(), context.DeadlineExceeded):
+		// Whatever the call returned, the deadline is the cause: a wait, not a fault.
+		err = fmt.Errorf("%w: %w: %w", model.ErrUnavailable, context.DeadlineExceeded, err)
+	}
 	s.logDecision(ctx, out, err)
 	return out, err
+}
+
+// unavailableReason names why a booking is ErrUnavailable, for its decision line.
+func unavailableReason(err error) string {
+	switch {
+	case errors.Is(err, model.ErrLockTimeout):
+		return "lock_timeout"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	}
+	return "rerun_failed"
 }
 
 // logDecision logs the booking's result. Rejections (404, 422) and failures are left to the
@@ -57,38 +73,39 @@ func (s *Service) logDecision(ctx context.Context, out model.Outcome, err error)
 		s.log.InfoContext(ctx, "booking created", "result", model.ResultCreated, "appointment_id", out.Appointment.ID,
 			"bay_id", out.Appointment.BayID, "technician_id", out.Appointment.TechnicianID)
 	case errors.Is(err, model.ErrUnavailable):
-		s.log.InfoContext(ctx, "booking unavailable after retries", "result", model.ResultUnavailable, "attempts", maxAttempts)
+		s.log.InfoContext(ctx, "booking unavailable", "result", model.ResultUnavailable, "reason", unavailableReason(err))
 	}
 }
 
 func (s *Service) book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
-	vehicleRerun := false
-	for attempt := 1; ; {
-		out, err := s.bookOnce(ctx, req, key)
-		switch {
-		case errors.Is(err, model.ErrVehicleBusy):
-			// The other booking has committed, so a fresh check normally returns the 409 and
-			// stores it on the key. It is not a lost race, so it does not count (D8).
-			if vehicleRerun {
-				return conflict(model.ReasonVehicleBusy, fmt.Sprintf("vehicle %s already has an overlapping appointment", req.VehicleID)), nil
-			}
-			vehicleRerun = true
-		case errors.Is(err, model.ErrBayTaken), errors.Is(err, model.ErrTechnicianTaken), errors.Is(err, model.ErrDeadlock):
-			if attempt == maxAttempts {
-				return model.Outcome{}, model.ErrUnavailable
-			}
-			s.log.InfoContext(ctx, "lost a race for a bay or technician", "result", model.ResultRetry, "attempt", attempt)
-			if err := sleep(ctx, minBackoff+rand.N(minBackoff)); err != nil {
-				return model.Outcome{}, err
-			}
-			attempt++
-		default:
-			return out, err
-		}
+	out, err := s.bookOnce(ctx, req, key)
+	if !lostRace(err) {
+		return out, err
 	}
+	// Normally the other booking has committed by now, so the fresh check returns the 409 and
+	// stores it on the key.
+	s.log.InfoContext(ctx, "constraint violation, re-running", "result", model.ResultRetry, "error", err)
+	if err := sleep(ctx, minBackoff+rand.N(minBackoff)); err != nil {
+		return model.Outcome{}, err
+	}
+	out, err = s.bookOnce(ctx, req, key)
+	switch {
+	case errors.Is(err, model.ErrVehicleBusy):
+		// Not stored: this transaction was rolled back. A same-key retry is evaluated again.
+		return conflict(model.ReasonVehicleBusy, fmt.Sprintf("vehicle %s already has an overlapping appointment", req.VehicleID)), nil
+	case lostRace(err):
+		return model.Outcome{}, model.ErrUnavailable
+	}
+	return out, err
 }
 
-// bookOnce runs one booking transaction: claim the key, then attempt, then store the outcome.
+// lostRace reports an insert rejected by an exclusion constraint or aborted by a deadlock.
+func lostRace(err error) bool {
+	return errors.Is(err, model.ErrBayTaken) || errors.Is(err, model.ErrTechnicianTaken) ||
+		errors.Is(err, model.ErrVehicleBusy) || errors.Is(err, model.ErrDeadlock)
+}
+
+// bookOnce runs one booking transaction: claim the key, attempt, then store the outcome.
 func (s *Service) bookOnce(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
 	var out model.Outcome
 	err := s.repo.InTx(ctx, func(ctx context.Context) error {
@@ -120,7 +137,7 @@ func (s *Service) bookOnce(ctx context.Context, req model.BookingRequest, key st
 	return out, err
 }
 
-// attempt runs one booking transaction body: 404 → 422 → 409 → insert (D9).
+// attempt runs one booking transaction body: 404 → 422 → lock → 409 → insert (D8, D9).
 func (s *Service) attempt(ctx context.Context, req model.BookingRequest) (model.Outcome, error) {
 	d, err := s.repo.GetDealership(ctx, req.DealershipID)
 	if err != nil {
@@ -141,14 +158,6 @@ func (s *Service) attempt(ctx context.Context, req model.BookingRequest) (model.
 	w := model.Interval{Start: req.Start, End: req.Start.Add(st.Duration)}
 	span := fmt.Sprintf("%s–%s", w.Start.In(d.Location).Format("15:04"), w.End.In(d.Location).Format("15:04"))
 
-	vehicleHasOverlap, err := s.repo.VehicleHasOverlap(ctx, v.ID, w)
-	if err != nil {
-		return model.Outcome{}, err
-	}
-	if vehicleHasOverlap {
-		return conflict(model.ReasonVehicleBusy, fmt.Sprintf("vehicle %s already has an appointment overlapping %s", v.ID, span)), nil
-	}
-
 	bays, err := s.repo.ListBays(ctx, d.ID)
 	if err != nil {
 		return model.Outcome{}, err
@@ -156,6 +165,19 @@ func (s *Service) attempt(ctx context.Context, req model.BookingRequest) (model.
 	techs, err := s.repo.ListQualifiedTechnicians(ctx, d.ID, st.RequiredSkill)
 	if err != nil {
 		return model.Outcome{}, err
+	}
+
+	// The lock covers the availability reads and the insert, nothing else: a 404 or 422 never
+	// waits on it. The key was claimed before it, always, so the two locks cannot form a cycle.
+	if err := s.repo.LockDealership(ctx, d.ID); err != nil {
+		return model.Outcome{}, err
+	}
+	vehicleHasOverlap, err := s.repo.VehicleHasOverlap(ctx, v.ID, w)
+	if err != nil {
+		return model.Outcome{}, err
+	}
+	if vehicleHasOverlap {
+		return conflict(model.ReasonVehicleBusy, fmt.Sprintf("vehicle %s already has an appointment overlapping %s", v.ID, span)), nil
 	}
 	taken, err := s.repo.ListBusy(ctx, d.ID, w)
 	if err != nil {

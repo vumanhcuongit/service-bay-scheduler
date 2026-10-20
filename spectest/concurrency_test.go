@@ -1,17 +1,25 @@
 package spectest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/handler"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/repository"
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/service"
 )
 
 // make races runs the pool tests 20 times in a row, in make ci and in CI, so a pass is not luck.
@@ -61,8 +69,8 @@ func TestN37(t *testing.T) {
 	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 1)
 }
 
-// Ten bookings race for the two OIL slots at 09:00: exactly two win, one per bay, and every
-// loser gets a clean 409 or 503, never a 500.
+// Ten bookings race for the two OIL slots at 09:00. The dealership lock runs them one at a
+// time, so exactly two win, one per bay, and every loser's check sees both: 409 no_bay, never 503.
 func TestTenRacersForTwoSlots(t *testing.T) {
 	e := newPoolEnv(t)
 	extraVehicles := []string{"V4", "V5", "V6", "V7", "V8", "V9", "V10"}
@@ -87,12 +95,10 @@ func TestTenRacersForTwoSlots(t *testing.T) {
 	}
 	var won []string
 	for _, r := range together(bookings...) {
-		switch r.Code {
-		case http.StatusCreated:
+		if r.Code == http.StatusCreated {
 			won = append(won, e.assigned(r))
-		case http.StatusConflict, http.StatusServiceUnavailable:
-		default:
-			t.Errorf("status %d, want 201, 409 or 503; body %s", r.Code, r.Body.String())
+		} else {
+			e.conflict(r, "no_bay")
 		}
 	}
 	slices.Sort(won)
@@ -101,30 +107,161 @@ func TestTenRacersForTwoSlots(t *testing.T) {
 }
 
 func TestN38(t *testing.T) {
-	f := &flakyRepo{failures: 1 << 30, err: model.ErrBayTaken}
+	f := &flakyRepo{errs: always(model.ErrBayTaken)}
 	e := newEnvWith(t, f.wrap)
 	r := e.book("V1", "OIL", "09:00", key(K5))
 	e.status(r, http.StatusServiceUnavailable)
 	expect(t, "Retry-After", r.Header().Get("Retry-After"), "1")
-	expect(t, "inserts", f.inserts, 3)
+	expect(t, "inserts", f.inserts, 2)
 	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 0)
 	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
 }
 
+// The re-run's own result decides: a vehicle violation is the only one that becomes a 409.
+func TestRerunOutcome(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		errs   []error
+		status int
+	}{
+		{"deadlock on re-run", []error{model.ErrBayTaken, model.ErrDeadlock}, http.StatusServiceUnavailable},
+		{"vehicle then bay", []error{model.ErrVehicleBusy, model.ErrBayTaken}, http.StatusServiceUnavailable},
+		{"deadlock then vehicle", []error{model.ErrDeadlock, model.ErrVehicleBusy}, http.StatusConflict},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &flakyRepo{errs: c.errs}
+			e := newEnvWith(t, f.wrap)
+			r := e.book("V1", "OIL", "09:00", key(K5))
+			if c.status == http.StatusConflict {
+				e.conflict(r, "vehicle_busy")
+			} else {
+				e.status(r, c.status)
+				expect(t, "Retry-After", r.Header().Get("Retry-After"), "1")
+			}
+			expect(t, "inserts", f.inserts, 2)
+			expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
+		})
+	}
+}
+
+// The same vehicle at two dealerships at once: each holds only its own dealership's lock, so
+// this is the race the lock cannot cover. The vehicle constraint and the re-run make it a 409.
+func TestVehicleAtTwoDealerships(t *testing.T) {
+	e := newPoolEnv(t)
+	rs := together(
+		func() *httptest.ResponseRecorder { return e.book("V1", "OIL", "09:00") },
+		func() *httptest.ResponseRecorder { return e.book("V1", "TIRE", "09:00", dl2()) },
+	)
+	won, lost := winnerFirst(rs)
+	e.status(won, http.StatusCreated)
+	e.conflict(lost, "vehicle_busy")
+	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 1)
+}
+
+// holdInOtherSession runs hold in a transaction on its own pool connection, as a concurrent
+// booking would, and returns once hold has run. release ends that transaction, rolled back.
+func holdInOtherSession(t *testing.T, e *env, hold func(r *repository.Repository, ctx context.Context) error) (release func()) {
+	t.Helper()
+	r := repository.New(e.db)
+	held, done := make(chan error, 1), make(chan error, 1)
+	stop := make(chan struct{})
+	go func() {
+		done <- r.InTx(context.Background(), func(ctx context.Context) error {
+			if err := hold(r, ctx); err != nil {
+				held <- err
+				return err
+			}
+			held <- nil
+			<-stop
+			return errRolledBack
+		})
+	}()
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		close(stop)
+		if err := <-done; !errors.Is(err, errRolledBack) {
+			t.Errorf("holding session: %v", err)
+		}
+	}
+}
+
+var errRolledBack = errors.New("rolled back on purpose")
+
+// A booking that waits on the dealership lock past lock_timeout gets a 503, never a 500.
+// The lock is held by another session, as a booking at the same dealership would hold it.
+func TestN39(t *testing.T) {
+	e := newPoolEnv(t)
+	release := holdInOtherSession(t, e, func(r *repository.Repository, ctx context.Context) error {
+		return r.LockDealership(ctx, "DL1")
+	})
+	rec := e.book("V1", "OIL", "09:00", key(K5))
+	release()
+	e.status(rec, http.StatusServiceUnavailable)
+	expect(t, "Retry-After", rec.Header().Get("Retry-After"), "1")
+	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 0)
+	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
+}
+
+// lock_timeout is set before the key claim, so a key held past it is a 503 too, not an
+// unbounded wait.
+func TestHeldKeyIs503(t *testing.T) {
+	e := newPoolEnv(t)
+	release := holdInOtherSession(t, e, func(r *repository.Repository, ctx context.Context) error {
+		_, err := r.ClaimKey(ctx, K5, "other", defaultNow)
+		return err
+	})
+	start := time.Now()
+	rec := e.book("V1", "OIL", "09:00", key(K5))
+	elapsed := time.Since(start)
+	release()
+	e.status(rec, http.StatusServiceUnavailable)
+	expect(t, "Retry-After", rec.Header().Get("Retry-After"), "1")
+	if elapsed > 3*time.Second {
+		t.Errorf("returned after %v, want about the 1 s lock timeout", elapsed)
+	}
+	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 0)
+	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
+}
+
+// A request deadline that passes during a wait, here shorter than lock_timeout, is a 503 with
+// reason deadline, not a 500.
+func TestDeadlineIs503(t *testing.T) {
+	e := newPoolEnv(t)
+	logs := &bytes.Buffer{}
+	log := slog.New(slog.NewTextHandler(logs, nil))
+	svc := service.New(repository.New(e.db), e.clock, log)
+	e.h = handler.New(svc, log, handler.Config{Timeout: 300 * time.Millisecond, Registry: prometheus.NewRegistry()})
+	release := holdInOtherSession(t, e, func(r *repository.Repository, ctx context.Context) error {
+		return r.LockDealership(ctx, "DL1")
+	})
+	rec := e.book("V1", "OIL", "09:00")
+	release()
+	e.status(rec, http.StatusServiceUnavailable)
+	expect(t, "Retry-After", rec.Header().Get("Retry-After"), "1")
+	if !strings.Contains(logs.String(), "result=unavailable reason=deadline") {
+		t.Errorf("no unavailable decision with reason=deadline in:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Errorf("a deadline was logged as an error:\n%s", logs.String())
+	}
+}
+
 func TestVehicleViolationTwiceIs409(t *testing.T) {
-	f := &flakyRepo{failures: 1 << 30, err: model.ErrVehicleBusy}
+	f := &flakyRepo{errs: always(model.ErrVehicleBusy)}
 	e := newEnvWith(t, f.wrap)
 	e.conflict(e.book("V1", "OIL", "09:00", key(K5)), "vehicle_busy")
 	expect(t, "inserts", f.inserts, 2)
 	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
 }
 
-// A lost race retries in a fresh transaction that claims the key again, so the 201 is stored
-// once and replays. A deadlock between concurrent inserts is such a lost race.
+// A constraint violation or deadlock re-runs in a fresh transaction that claims the key again,
+// so the 201 is stored once and replays.
 func TestLostRaceRetriesWithKey(t *testing.T) {
 	for _, lost := range []error{model.ErrBayTaken, model.ErrTechnicianTaken, model.ErrDeadlock} {
 		t.Run(lost.Error(), func(t *testing.T) {
-			f := &flakyRepo{failures: 1, err: lost}
+			f := &flakyRepo{errs: []error{lost}}
 			e := newEnvWith(t, f.wrap)
 			r1 := e.book("V1", "OIL", "09:00", key(K5))
 			e.created(r1, "B1", "T1")
@@ -136,14 +273,14 @@ func TestLostRaceRetriesWithKey(t *testing.T) {
 	}
 }
 
-// The usual vehicle violation: the other booking has committed by the time ours hits the
-// constraint, so the immediate re-run's fresh check returns the 409, which is stored and replays.
+// The usual vehicle violation: the same vehicle booked at DL2 has committed by the re-run, so
+// its fresh check returns the 409, which is stored and replays.
 func TestVehicleViolationRerunStores409(t *testing.T) {
-	f := &flakyRepo{failures: 1, err: model.ErrVehicleBusy}
+	f := &flakyRepo{errs: []error{model.ErrVehicleBusy}}
 	e := newPoolEnvWith(t, f.wrap)
 	f.onInsert = func() {
 		if f.inserts == 1 {
-			e.given("V1", "OIL", "09:00", "B2", "T2") // commits on its own connection
+			e.given("V1", "TIRE", "09:00", "B3", "T4") // DL2's row, committed on its own connection
 		}
 	}
 	r1 := e.book("V1", "OIL", "09:00", key(K5))
@@ -158,7 +295,7 @@ func TestBackoffStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var cancelledAt time.Time
-	f := &flakyRepo{failures: 1 << 30, err: model.ErrBayTaken}
+	f := &flakyRepo{errs: always(model.ErrBayTaken)}
 	f.onInsert = func() {
 		if f.inserts == 1 {
 			cancelledAt = time.Now()

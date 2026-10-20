@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -22,7 +23,7 @@ func (r *Repository) GetDealership(ctx context.Context, id string) (model.Dealer
 	if err != nil {
 		return model.Dealership{}, rowErr("dealership", err)
 	}
-	loc, err := time.LoadLocation(tz)
+	loc, err := location(tz)
 	if err != nil {
 		return model.Dealership{}, fmt.Errorf("dealership %s timezone: %w", id, err)
 	}
@@ -115,6 +116,21 @@ func (r *Repository) VehicleHasOverlap(ctx context.Context, vehicleID string, w 
 		return false, fmt.Errorf("vehicle overlap: %w", err)
 	}
 	return exists, nil
+}
+
+// locations caches time.LoadLocation by name; a *time.Location is safe to share.
+var locations sync.Map
+
+func location(name string) (*time.Location, error) {
+	if loc, ok := locations.Load(name); ok {
+		return loc.(*time.Location), nil
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, err
+	}
+	locations.Store(name, loc)
+	return loc, nil
 }
 
 func seconds(s int64) time.Duration { return time.Duration(s) * time.Second }

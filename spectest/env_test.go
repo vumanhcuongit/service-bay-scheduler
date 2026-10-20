@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -77,15 +78,17 @@ func newEnvOn(t *testing.T, db repository.DB, wrap func(service.Repository) serv
 	return &env{t: t, h: handler.New(svc, log, handler.Config{Registry: prometheus.NewRegistry()}), svc: svc, clock: clk, db: db}
 }
 
-// flakyRepo fails the first `failures` InsertAppointment calls with err, then delegates.
-// onInsert, if set, runs after every call.
+// flakyRepo fails InsertAppointment calls with errs, in order, then delegates. inserts counts
+// the failed calls. onInsert, if set, runs after every call.
 type flakyRepo struct {
 	service.Repository
-	failures int
-	err      error
+	errs     []error
 	inserts  int
 	onInsert func()
 }
+
+// always is more failures than a booking ever makes.
+func always(err error) []error { return slices.Repeat([]error{err}, 10) }
 
 func (f *flakyRepo) wrap(r service.Repository) service.Repository {
 	f.Repository = r
@@ -96,9 +99,9 @@ func (f *flakyRepo) InsertAppointment(ctx context.Context, a model.Appointment) 
 	if f.onInsert != nil {
 		defer f.onInsert()
 	}
-	if f.inserts < f.failures {
+	if f.inserts < len(f.errs) {
 		f.inserts++
-		return model.Appointment{}, f.err
+		return model.Appointment{}, f.errs[f.inserts-1]
 	}
 	return f.Repository.InsertAppointment(ctx, a)
 }

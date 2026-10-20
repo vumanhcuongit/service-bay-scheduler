@@ -41,9 +41,9 @@ HTTP/1.1 409 Conflict
 
 ## The design decision that matters
 
-Two requests ask for 09:00 tomorrow at the same dealership while only one bay is left. Both run the availability check, both see the same bay free, and both go on to insert. Without a guard below the application, that bay now has two cars at 09:00, which is the double booking the dealership had by hand ([docs/design.md](docs/design.md#1-problem)).
+A booking reads the calendar, then writes. Anything that writes in between makes that read stale: another booking at the same moment, a code path that does not go through the booking (a bulk import, a reschedule), or the same car booked at another dealership. Without a guard below the application, a bay or a car ends up with two bookings at 09:00, which is the double booking the dealership had by hand ([docs/design.md](docs/design.md#1-problem)).
 
-A check in Go cannot close that gap, because it reads the calendar before it writes, and the other request can commit in between. An in-process lock does not close it either: it serialises requests inside one process, so with two instances behind a load balancer each holds its own lock and both still insert. Decision D8 in [docs/decisions.md](docs/decisions.md) lists the alternatives and why they were rejected.
+A check in Go cannot close that gap, because a check in Go protects only the code that runs it, and only inside one process. An in-process lock does not close it either: it serialises requests inside one process, so with two instances behind a load balancer each holds its own lock and both still insert. Decision D8 in [docs/decisions.md](docs/decisions.md) lists the alternatives and why they were rejected.
 
 The guard is in Postgres, as three exclusion constraints on `appointments`, one each for the bay, the technician and the vehicle ([migrations/00001_schema.sql](migrations/00001_schema.sql)). The bay one reads:
 
@@ -51,22 +51,24 @@ The guard is in Postgres, as three exclusion constraints on `appointments`, one 
 EXCLUDE USING gist (bay_id WITH =, tstzrange(start, "end") WITH &&) WHERE (status = 'confirmed')
 ```
 
-Postgres rejects a second confirmed row whose time range overlaps another on the same bay, whichever instance or code path wrote it, so the booking is correct for every code path and every number of instances, and the Go check only exists to say why a booking was refused. The schema is in [docs/design.md](docs/design.md#5-data-model).
+Postgres rejects a second confirmed row whose time range overlaps another on the same bay, whichever instance or code path wrote it, so no code path and no number of instances can store an overlap, and the Go overlap check only exists to say why a booking was refused. Skill, opening hours and dealership membership are checked in Go, not by the database. The schema is in [docs/design.md](docs/design.md#5-data-model).
+
+The constraint keeps the calendar correct; a per-dealership advisory lock, taken after the 404 and 422 checks and held through the availability reads and the insert, keeps it live. Both are needed. On its own the constraint deadlocks under contention: inserts that clash on it wait on each other's uncommitted rows, in chains, and losers ran past the deadline into 500s (`ceb8c6d`). On its own the lock only covers code that takes it: any code path that does not, now or later (a bulk import, a reschedule), still cannot store an overlap because of the constraint, and across dealerships the vehicle constraint is the only guard. Together, a dealership's bookings take turns, every loser gets a clean 409, or a 503 with Retry-After when the queue outlasts the lock timeout, and the one race left, the same vehicle at two dealerships, gets one re-run.
 
 ## Where to look first
 
 With ten minutes, read these in order:
 
 1. [migrations/00001_schema.sql](migrations/00001_schema.sql): the three exclusion constraints at the end of the `appointments` table.
-2. [internal/service/booking.go](internal/service/booking.go): the check order (key, 404, 422, 409) and the retry loop after a lost race.
+2. [internal/service/booking.go](internal/service/booking.go): the check order (key, 404, 422, dealership lock, 409) and the one re-run after a constraint violation.
 3. [spectest/concurrency_test.go](spectest/concurrency_test.go): the races, run against a real Postgres with real commits.
 4. [docs/reviews/](docs/reviews/): what the AI found in the decisions and the spec, and what I ruled on each point.
 
 ## How it was built
 
-I wrote [docs/decisions.md](docs/decisions.md) first (`3dc31d7`), along with the seed data and the key examples. From them, the AI wrote the [spec](docs/superpowers/specs/2026-10-20-booking.md), the [plan](docs/superpowers/plans/2026-10-20-backend.md) and the code. A second agent with no context red-teamed the spec twice, once before it was frozen and once against the running server, and a third reviewed every PR. The red-team output is in [docs/reviews/](docs/reviews/), and each fix from a review is a `fix(ai):` commit ending "caught in PR review". I read every diff and ruled on every finding.
+I wrote [docs/decisions.md](docs/decisions.md) first (`3dc31d7`), along with the seed data and the key examples. From them, the AI wrote the [spec](docs/superpowers/specs/2026-10-20-booking.md), the [plan](docs/superpowers/plans/2026-10-20-backend.md) and the code. A second agent with no context red-teamed the spec twice, once before it was frozen and once against the running server, and a third reviewed every PR. The red-team output is in [docs/reviews/](docs/reviews/), and each fix from a review is a `fix(ai):` commit ending "caught in <where>": PR review, final review, red-team, CI, a grading pass or reading the README. I read every PR diff and ruled on every finding.
 
-The spec has 63 examples, and every one is a test with the same name, `TestM1` to `TestM25` and `TestN1` to `TestN38` in [spectest/](spectest), out of 106 test functions in total. `make layers` enforces the import rule between the layers in CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)). The concurrency tests commit to a real Postgres instead of rolling back ([internal/testdb/testdb.go](internal/testdb/testdb.go)), and one of them fires ten bookings at the same 09:00 slot, where two bays are free, and expects exactly two to win ([spectest/concurrency_test.go](spectest/concurrency_test.go)). `make races` runs them 20 times in a row, in `make ci` and in CI.
+The spec has 64 examples, and every one is a test with the same name, `TestM1` to `TestM25` and `TestN1` to `TestN39` in [spectest/](spectest), out of 114 test functions in total. `make layers` enforces the import rule between the layers in CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)). The concurrency tests commit to a real Postgres instead of rolling back ([internal/testdb/testdb.go](internal/testdb/testdb.go)), and one of them fires ten bookings at the same 09:00 slot, where two bays are free, and expects exactly two to win ([spectest/concurrency_test.go](spectest/concurrency_test.go)). `make races` runs them 20 times in a row, in `make ci` and in CI.
 
 ## Run it
 
@@ -76,6 +78,7 @@ You need Go 1.24 and Docker.
 make db-up migrate run   # Postgres 16 in Docker, migrations + seed, server on :8080
 make test                # every spec example against Postgres
 make ci                  # vet, layer check, lint, test, 20 concurrency runs, as CI runs them
+make docker-build        # the server image: static binary on distroless
 ```
 
 The commands, the seed data and the full curl list are in [More examples](#more-examples) at the end.
@@ -86,9 +89,11 @@ How the AI was directed in the design phase, where I decided and it challenged, 
 
 The checking did not rely on the AI's own account of its work. The tests came from the spec, so "done" meant the spec examples passed, not that the code looked right, and the plan made the AI stop after each task and show the diff, which I read ([docs/superpowers/plans/2026-10-20-backend.md](docs/superpowers/plans/2026-10-20-backend.md)). `make layers` fails the build on an import that breaks the layer rules, handler → service → model and repository → model ([Makefile](Makefile)). A reviewer agent in a clean context went over each PR and a red-team agent went over the spec twice ([docs/reviews/](docs/reviews/)), and every fix that came out of review, red-team or CI is a `fix(ai):` commit that says what was wrong and how it was caught.
 
-Three of the 20 `fix(ai):` commits show where it was wrong. In `ceb8c6d`, concurrent inserts on one slot deadlocked (40P01) and ran past the request deadline, so the losing requests got a 500; the final review caught it. In `526882b`, the check order was built but not tested, so swapping any two checks still passed; PR review caught it. In `cb3d5ce`, an empty `Idempotency-Key` header was treated as no key, so the booking ran without one; the second red-team pass caught it ([docs/reviews/red-team-2.md](docs/reviews/red-team-2.md) #6). It also pushed back on me and was right: my first D9 returned 409 for a booking outside opening hours (`3dc31d7`), it argued that 409 means the current state blocks a booking while this request is invalid in itself, and the decision changed to 422 ([decisions.md §5](docs/decisions.md#5-challenge-log) #3).
+Three of the 24 `fix(ai):` commits show where it was wrong. In `ceb8c6d`, concurrent inserts on one slot deadlocked (40P01) and ran past the request deadline, so the losing requests got a 500; the final review caught it. In `526882b`, the check order was built but not tested, so swapping any two checks still passed; PR review caught it. In `cb3d5ce`, an empty `Idempotency-Key` header was treated as no key, so the booking ran without one; the second red-team pass caught it ([docs/reviews/red-team-2.md](docs/reviews/red-team-2.md) #6). It also pushed back on me and was right: my first D9 returned 409 for a booking outside opening hours (`3dc31d7`), it argued that 409 means the current state blocks a booking while this request is invalid in itself, and the decision changed to 422 ([decisions.md §5](docs/decisions.md#5-challenge-log) #3).
 
-For a team, I would standardise four things from this. Decisions and an example-based spec are written by a person and frozen before any AI writes code. Every spec example becomes a test with the same name. Review and red-teaming run in a separate agent with a clean context. AI fixes are committed as `fix(ai): <what was wrong>, caught in <where>`, so the history records where the AI fails and which check caught it.
+A grading pass then compared the code with the docs and found they had drifted at the headline decision: after `ceb8c6d` the code took a per-dealership lock after the checks, kept the three-attempt retry loop, and no doc mentioned the lock. The fix was to change the design, taking the lock first in the transaction and cutting the retries to one re-run, and then the docs to match, not the docs alone (`ed17c38`). PR review on that fix then moved the lock after the 404 and 422 checks, so a rejection never waits on it, and bounded the wait with `lock_timeout` (`8d23da7`).
+
+For a team, I would standardise four things from this. Decisions and an example-based spec are written by a person and frozen before any AI writes code. Every spec example becomes a test with the same name. Review and red-teaming run in a separate agent with a clean context. AI fixes are committed as `fix(ai): <what was wrong>, caught in <where>`, so the history records where the AI fails and which check caught it. The chain did not stop at one fix: the grading pass led to a redesign (`ed17c38`), two PR reviews tightened it (`8d23da7`, `48a739e`), and the second review's 1 s lock timeout, equal to Postgres's deadlock timeout, made a cross-dealership race fail one run in sixty in `make races`. That failure became the rule in D8 that any wait which can deadlock needs a `lock_timeout` longer than `deadlock_timeout`, or both sides lose (`6b6604c`).
 
 ## Out of scope
 
@@ -98,7 +103,7 @@ Cancelling, rescheduling, notifications and authentication are left out on purpo
 
 - [docs/design.md](docs/design.md): the architecture, the data flow, the tech choices and how the service scales.
 - [docs/decisions.md](docs/decisions.md): every rule with its reason and the alternatives, plus the AI challenge log.
-- [docs/superpowers/specs/2026-10-20-booking.md](docs/superpowers/specs/2026-10-20-booking.md): the behaviour, as the 63 examples the tests run.
+- [docs/superpowers/specs/2026-10-20-booking.md](docs/superpowers/specs/2026-10-20-booking.md): the behaviour, as the 64 examples the tests run.
 - [openapi.yaml](openapi.yaml): the API contract.
 - [docs/reviews/](docs/reviews/): the verbatim output of the challenge and red-team agents, with my ruling on each point.
 
