@@ -3,6 +3,7 @@ package testdb_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -115,5 +116,29 @@ func TestExclusionConstraintsArePartialOnStatus(t *testing.T) {
 	// Half-open: a booking starting where the other ends does not overlap.
 	if _, err := tx.Exec(ctx, insert, "V2", "B1", "T1", "2026-10-21T02:30:00Z", "2026-10-21T03:00:00Z"); err != nil {
 		t.Fatalf("back to back: %v", err)
+	}
+}
+
+// The overlap reads are served by the gist indexes behind the exclusion constraints. A btree on
+// (dealership_id, start) cannot seek on an overlap predicate and was dropped (migration 00003),
+// so a second index on appointments is an addition someone has to justify.
+func TestAppointmentsIndexes(t *testing.T) {
+	ctx := context.Background()
+	tx := testdb.Tx(t)
+	rows, err := tx.Query(ctx, `SELECT indexname FROM pg_indexes WHERE tablename = 'appointments' ORDER BY indexname`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, name)
+	}
+	want := []string{"appointments_bay_excl", "appointments_pkey", "appointments_technician_excl", "appointments_vehicle_excl"}
+	if !slices.Equal(got, want) {
+		t.Errorf("indexes on appointments = %v, want %v", got, want)
 	}
 }
