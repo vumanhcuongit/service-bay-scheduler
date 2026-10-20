@@ -41,7 +41,7 @@ HTTP/1.1 409 Conflict
 
 ## The design decision that matters
 
-Two requests ask for 09:00 tomorrow at the same dealership while only one bay is left. Both run the availability check, both see the same bay free, and both go on to insert. Without a guard below the application, that bay now has two cars at 09:00, which is the double booking the dealership had by hand ([docs/design.md](docs/design.md#1-problem)).
+A booking reads the calendar, then writes. Anything that writes in between makes that read stale: another booking at the same moment, a code path that does not go through the booking (a bulk import, a reschedule), or the same car booked at another dealership. Without a guard below the application, a bay or a car ends up with two bookings at 09:00, which is the double booking the dealership had by hand ([docs/design.md](docs/design.md#1-problem)).
 
 A check in Go cannot close that gap, because it reads the calendar before it writes, and the other request can commit in between. An in-process lock does not close it either: it serialises requests inside one process, so with two instances behind a load balancer each holds its own lock and both still insert. Decision D8 in [docs/decisions.md](docs/decisions.md) lists the alternatives and why they were rejected.
 
@@ -53,7 +53,7 @@ EXCLUDE USING gist (bay_id WITH =, tstzrange(start, "end") WITH &&) WHERE (statu
 
 Postgres rejects a second confirmed row whose time range overlaps another on the same bay, whichever instance or code path wrote it, so no code path and no number of instances can store an overlap, and the Go overlap check only exists to say why a booking was refused. Skill, opening hours and dealership membership are checked in Go, not by the database. The schema is in [docs/design.md](docs/design.md#5-data-model).
 
-The constraint keeps the calendar correct; a per-dealership advisory lock, taken right after the idempotency key and before any check, keeps it live. Both are needed. On its own the constraint deadlocks under contention: inserts that clash on it wait on each other's uncommitted rows, in chains, and losers ran past the deadline into 500s (`ceb8c6d`). On its own the lock is a convention a future code path could skip. Together, a dealership's bookings run one at a time, every loser gets a clean 409, and the one race left, the same vehicle at two dealerships, gets one re-run.
+The constraint keeps the calendar correct; a per-dealership advisory lock, taken after the 404 and 422 checks and held through the availability reads and the insert, keeps it live. Both are needed. On its own the constraint deadlocks under contention: inserts that clash on it wait on each other's uncommitted rows, in chains, and losers ran past the deadline into 500s (`ceb8c6d`). On its own the lock only covers code that takes it: any code path that does not, now or later (a bulk import, a reschedule), still cannot store an overlap because of the constraint, and across dealerships the vehicle constraint is the only guard. Together, a dealership's bookings take turns, every loser gets a clean 409, and the one race left, the same vehicle at two dealerships, gets one re-run.
 
 ## Where to look first
 
