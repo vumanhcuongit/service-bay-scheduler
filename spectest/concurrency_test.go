@@ -14,8 +14,7 @@ import (
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 )
 
-// Run the pool tests with -count=20 so a pass is not luck:
-// go test ./spectest/ -run 'TestM17|TestM25|TestN3[67]|TestTenRacers' -count=20
+// make races runs the pool tests 20 times in a row, in make ci and in CI, so a pass is not luck.
 
 func TestM17(t *testing.T) {
 	e := newPoolEnv(t)

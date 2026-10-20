@@ -50,3 +50,6 @@ jobs:
 
       - name: Test
         run: make test
+
+      - name: Races
+        run: make races

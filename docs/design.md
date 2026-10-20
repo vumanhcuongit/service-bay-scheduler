@@ -12,6 +12,21 @@ A dealership books service work by phone and by hand, so the same bay or technic
 The advisor needs to know, while the customer is still on the line, which times actually work for this service.
 Once a time is confirmed it must hold: a bay and a qualified technician are reserved for the whole job, and nothing else can take them.
 
+### 1.1 What must not happen
+
+A booking system earns trust by never doing a small number of things. This design is organised around those, and the rest of the document is how each one is held. Each row names the failure, the mechanism that prevents it, where to read about it, and the test that proves it. Test names are the spec's example numbers: `N36` is example N36 in the [booking spec](superpowers/specs/2026-10-20-booking.md) and `TestN36` in [spectest/](../spectest/). M is a case that must succeed, N a case that must be rejected.
+
+| Failure | What prevents it | Read | Test |
+|---|---|---|---|
+| Two cars booked into the same bay, or with the same technician, at the same time | Postgres refuses the second overlapping row (exclusion constraints). The check in Go only explains why; it is not what keeps the calendar correct | §5, D8 | [N36](../spectest/concurrency_test.go), [M25](../spectest/concurrency_test.go), run 20× in CI |
+| One car booked in two places at once | a third exclusion constraint, on the vehicle | §5, D8 | [N37](../spectest/concurrency_test.go) |
+| A booking confirmed when only the bay or only the technician was free, or when one of them was free at the start but busy later in the job | both must be free for the whole `[start, end)`; the check runs on the full interval, and the constraints use the full interval too | §4 step 7, D6, D7 | [N9](../spectest/conflict_test.go), [N10](../spectest/conflict_test.go), [N11](../spectest/conflict_test.go) |
+| A job given to someone who cannot do it | technicians are filtered by the service's required skill before any are considered | §4 step 7, D3, D4 | [N14](../spectest/conflict_test.go), [N15](../spectest/conflict_test.go) |
+| A job that runs past closing time, or past the technician's shift | the whole `[start, end)` must fit inside the dealership's hours and the technician's window | §4 steps 6–7, D2, D4 | [N1–N3](../spectest/time_test.go), [N16](../spectest/conflict_test.go) |
+| A customer who retries ends up with two appointments | the idempotency key is claimed inside the same transaction as the booking; a retry replays the first answer | §4, D9 | [M15](../spectest/idempotency_test.go), [M17](../spectest/concurrency_test.go) |
+| A customer turned away while another bay was free | a lost race is retried with a fresh look at the calendar, up to three times | §4, D8 | [M25](../spectest/concurrency_test.go) |
+| A booking saved without its key, or a key saved without its booking | both rows commit or roll back together; nothing is written outside the transaction | §4, §5, D9 | [N38](../spectest/concurrency_test.go) |
+
 ## 2. Architecture
 
 ```mermaid
@@ -79,13 +94,13 @@ Happy path, with a key:
 
 1. Request-id middleware sets the id. Access middleware logs the request in and starts the latency timer.
 2. Handler decodes and validates the body. Malformed → **400**, nothing touched in the DB.
-3. Domain opens a transaction and inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9).
+3. Domain opens a transaction and inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9; 1.1 row 6).
 4. No existing row (or one older than 24 h) → continue as new.
 5. Domain loads dealership, vehicle, service type. Unknown → **404**, rollback (key row goes too).
-6. Domain checks the request against the rules: aligned, `start > now`, inside hours, service type belongs to dealership. Fails → **422**, rollback.
-7. Domain checks the vehicle, then bays, then technicians, using the rules in D4–D7. First failure becomes the 409 reason.
+6. Domain checks the request against the rules: aligned, `start > now`, inside hours, service type belongs to dealership. Fails → **422**, rollback (1.1 row 5).
+7. Domain checks the vehicle, then bays, then technicians, using the rules in D4–D7 (1.1 rows 3–5). First failure becomes the 409 reason.
 8. Domain picks the first free bay and first free qualified technician by id and inserts the appointment.
-9. Domain writes the result onto the key row and commits. Key row and appointment land together.
+9. Domain writes the result onto the key row and commits. Key row and appointment land together (1.1 row 8).
 10. Handler returns **201**. Access middleware logs the result and records metrics.
 
 **409 path.** Step 7 finds a blocker (`vehicle_busy`, `no_bay` or `no_technician`). The domain writes the 409 result onto the key row and commits the key row alone. Handler returns **409** with the reason. A retry with the same key replays the same 409.
@@ -94,7 +109,7 @@ Happy path, with a key:
 
 1. Postgres aborts the loser's transaction; everything in it, including its key row, is gone.
 2. Repository maps the violation to `ErrBayTaken` or `ErrTechnicianTaken`.
-3. Domain waits a short random 50–100 ms, then starts a new transaction and re-runs from step 3. The fresh check either finds another candidate, or a real 409. The random wait keeps two losers from colliding again on the same next candidate.
+3. Domain waits a short random 50–100 ms, then starts a new transaction and re-runs from step 3. The fresh check either finds another candidate, or a real 409 (1.1 row 7). The random wait keeps two losers from colliding again on the same next candidate.
 4. After 3 attempts in total, the domain returns "unavailable". Handler returns **503** with `Retry-After: 1`. Nothing is stored, so the client's retry with the same key runs as new.
 
 A vehicle violation at step 8 is different: no other candidate can fix it, so it goes straight to **409** `vehicle_busy` with no retry (D8). In code, "straight" is one immediate re-run with no backoff: the violation means the other booking has committed, so the fresh check at step 7 returns `vehicle_busy` and stores it on the key row like any other 409. If that re-run hits the vehicle constraint again, the domain returns **409** `vehicle_busy` without storing it, never 500.
@@ -135,7 +150,7 @@ Bookings:
 | `appointments` | `id`, `dealership_id`, `customer_id`, `vehicle_id`, `service_type_id`, `bay_id`, `technician_id`, `start`, `end`, `status` |
 | `idempotency_keys` | `key` (PK), `request_hash`, `status`, `body`, `created_at` |
 
-The three exclusion constraints on `appointments`, each partial `WHERE status = 'confirmed'`:
+The three exclusion constraints on `appointments`, each partial `WHERE status = 'confirmed'` (1.1 rows 1–3):
 
 ```sql
 EXCLUDE USING gist (bay_id        WITH =, tstzrange(start, "end") WITH &&)
@@ -145,7 +160,7 @@ EXCLUDE USING gist (vehicle_id    WITH =, tstzrange(start, "end") WITH &&)
 
 `tstzrange` defaults to `[)`, which is the half-open rule from D6. Equality on a text id inside a gist index needs the `btree_gist` extension. The gist indexes that back these constraints also serve the "who is busy between X and Y" reads.
 
-`idempotency_keys` uses the primary key as the lock: a second insert of the same key waits until the first transaction ends.
+`idempotency_keys` uses the primary key as the lock: a second insert of the same key waits until the first transaction ends (1.1 row 6).
 
 **Why the database is the final guard.** The domain check in step 7 runs before the insert, so two requests can both see a free bay and both try to take it. Any check in Go has this gap, and an in-process lock doesn't help once there are two instances. The exclusion constraint closes it: Postgres rejects the second overlapping row no matter which instance or code path wrote it. The domain check is still there, but its job is to produce a clear 409 reason, not to keep the calendar correct. Reasoning and alternatives: D8.
 
@@ -259,3 +274,12 @@ See [decisions.md §3](decisions.md#3-out-of-scope-deliberate).
 
 ## 10. How GenAI was used in design
 
+The rule for the design phase was that I decide and the AI challenges. I wrote decisions.md myself before the AI saw it (`3dc31d7`), then gave it to a challenger agent, which raised 16 points ([reviews/decisions-challenge.md](reviews/decisions-challenge.md)), each logged with my verdict in [decisions.md §5](decisions.md#5-challenge-log). It found that D8 guarded bays and technicians against overlap but not the vehicle, so the vehicle became the third exclusion constraint (decisions.md §5 #1). It also argued that first-by-id assignment can spend a scarce skill on a job anyone could do; I kept the rule and recorded the cost in decisions.md §3 instead (decisions.md §5 #6).
+
+The spec was then written as examples, not prose, with the AI, from my seed data and my key cases ([booking spec](superpowers/specs/2026-10-20-booking.md)). Each example was written to become one test, and later did. Concrete Given / When / Then rows exposed what prose had let me skip: nothing said which 409 reason wins when the bay and the technician are both busy, which is now `no_bay` ([decisions.md §6](decisions.md#6-spec-review-log) #1). The technician's own hours had no rule saying they were checked, and the seed was changed so the rule could be tested, with T2 ending at 13:00 (decisions.md §6 #11).
+
+The spec was red-teamed twice, each time by an agent in a new session with a clean context that got only the spec and `openapi.yaml`, with no code and no discussion ([reviews/README.md](reviews/README.md)). A clean context matters because an agent that watched a rule being argued out tends to accept it, while one that sees only the contract tests what it actually says. Pass 1 ran before the spec was frozen and raised 20 points: 16 went into the spec or decisions (`24776f8`), 3 were ruled out of scope and 1 was deferred ([reviews/red-team-1.md](reviews/red-team-1.md)). Pass 2 ran 19 cases with curl against the running server and found 3 bugs (`cb3d5ce`, `36de09c`, `f86ea32`), one spec wording error and five input rules that went into D9 (`2b8d9be`, [reviews/red-team-2.md](reviews/red-team-2.md)).
+
+Review was a separate role too: each PR was reviewed by a clean-context agent that had not written the code, given the spec, decisions, design, plan and diff ([reviews/README.md](reviews/README.md)), with findings as `file:line` for me to judge, and the 13 fixes it led to are the `fix(ai):` commits ending "caught in PR review". It was right that pgx sent `statement_timeout` as a startup parameter, which PgBouncer rejects, so this document's §8 claim that a transaction-mode pooler works no longer held: the code broke the claim and review caught it (`b24f9c4`). The implementer pushed back with evidence twice and won: when the reviewer called decisions.md §5 #2 inaccurate, it argued to keep the status check as the last guard against a typo, and I agreed and reworded decisions.md §5 #2 instead (`2377381`); and when I ruled that any printable `X-Request-ID` should be accepted, it showed the rule had been `[A-Za-z0-9._-]{1,128}` since `923427d` and in `openapi.yaml`, and I withdrew the ruling ([reviews/red-team-2.md](reviews/red-team-2.md) #19). The rest of the build-phase story is in the [README](../README.md#ai-collaboration).
+
+The last pass was on this document: an interview-question pass asked what a senior engineer would put to this design, and the question of what changes on MySQL, which has no exclusion constraints, became the three alternatives and the slot-table choice in §6 Tech choices above (`54313f5`). Counted from [docs/reviews/](reviews/README.md) and the git log, the decisions challenge and red-team pass 1 raised 36 points, of which I accepted 31, overruled 4 (one kept, three ruled out of scope) and deferred 1; pass 2 ran 19 cases and found 3 bugs; PR review led to 13 fixes; and the implementer overruled the reviewer once (the status check) and me once (`X-Request-ID`, red-team pass 2 #19). What I'd change: this document's §8 claimed that nothing relies on session state and nothing checked it until code review, so next time every claim in §7 Observability and §8 Scale & reliability of this document gets a check, the way `make layers` checks the import rule, or is marked as an estimate.
