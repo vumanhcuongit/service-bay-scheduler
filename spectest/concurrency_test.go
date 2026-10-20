@@ -191,6 +191,75 @@ func TestVehicleAtTwoDealerships(t *testing.T) {
 	expect(t, "inserts", c.inserts.Load(), rounds)
 }
 
+// noLockRepo turns both advisory locks into no-ops, so only the exclusion constraints stand
+// between a race and a double booking.
+type noLockRepo struct{ service.Repository }
+
+func noLocks(r service.Repository) service.Repository { return noLockRepo{r} }
+
+func (noLockRepo) LockDealership(context.Context, string) error { return nil }
+
+func (noLockRepo) LockVehicle(context.Context, string) error { return nil }
+
+// With the locks gone, the bookings of M25, N36 and N37, and one vehicle at two dealerships, still never leave two confirmed rows
+// that overlap on one bay, technician or vehicle, and never fail with a 500. This is what
+// shows the constraints do the work: with them dropped, the same races double-book. The lock
+// is for liveness; a race without it may be a 201, a 409 or a 503, in any mix. make races
+// repeats it, so a pass is not luck. Without locks every racer picks the same first bay and
+// technician, so the bay and technician constraints are proven together, not one by one: drop
+// only one and the other still catches it. The vehicle constraint is proven alone, by the
+// two-dealership scenario.
+func TestConstraintsHoldWithoutLocks(t *testing.T) {
+	scenarios := map[string]func(e *env) []func() *httptest.ResponseRecorder{
+		"M25": func(e *env) []func() *httptest.ResponseRecorder {
+			return []func() *httptest.ResponseRecorder{
+				func() *httptest.ResponseRecorder { return e.book("V1", "OIL", "09:00") },
+				func() *httptest.ResponseRecorder { return e.book("V2", "OIL", "09:00") },
+			}
+		},
+		"N36": func(e *env) []func() *httptest.ResponseRecorder {
+			return []func() *httptest.ResponseRecorder{
+				func() *httptest.ResponseRecorder { return e.book("V1", "BRAKE", "09:00") },
+				func() *httptest.ResponseRecorder { return e.book("V2", "BRAKE", "09:00") },
+			}
+		},
+		"N37": func(e *env) []func() *httptest.ResponseRecorder {
+			return []func() *httptest.ResponseRecorder{
+				func() *httptest.ResponseRecorder { return e.book("V1", "OIL", "09:00") },
+				func() *httptest.ResponseRecorder { return e.book("V1", "BRAKE", "09:00") },
+			}
+		},
+		// N37 books the same bay and technician too, so those constraints would catch it with the
+		// vehicle one gone. Two dealerships share neither, so only the vehicle constraint is left.
+		"vehicle at two dealerships": func(e *env) []func() *httptest.ResponseRecorder {
+			return []func() *httptest.ResponseRecorder{
+				func() *httptest.ResponseRecorder { return e.book("V1", "OIL", "09:00") },
+				func() *httptest.ResponseRecorder { return e.book("V1", "TIRE", "09:00", dl2()) },
+			}
+		},
+	}
+	for name, bookings := range scenarios {
+		t.Run(name, func(t *testing.T) {
+			e := newPoolEnvWith(t, noLocks)
+			for _, r := range together(bookings(e)...) {
+				switch r.Code {
+				case http.StatusCreated, http.StatusConflict, http.StatusServiceUnavailable:
+				default:
+					t.Fatalf("status %d, want 201, 409 or 503; body %s", r.Code, r.Body.String())
+				}
+			}
+			for _, resource := range []string{"bay_id", "technician_id", "vehicle_id"} {
+				if n := e.count(`SELECT count(*) FROM appointments a JOIN appointments b
+					ON a.id < b.id AND a.` + resource + ` = b.` + resource + `
+					AND a.start < b."end" AND b.start < a."end"
+					WHERE a.status = 'confirmed' AND b.status = 'confirmed'`); n != 0 {
+					t.Errorf("%d overlapping pair(s) on %s", n, resource)
+				}
+			}
+		})
+	}
+}
+
 // holdInOtherSession runs hold in a transaction on its own pool connection, as a concurrent
 // booking would, and returns once hold has run. release ends that transaction, rolled back.
 func holdInOtherSession(t *testing.T, e *env, hold func(r *repository.Repository, ctx context.Context) error) (release func()) {
