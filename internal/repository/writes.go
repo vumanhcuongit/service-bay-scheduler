@@ -19,13 +19,9 @@ const (
 	// deadlockDetected: two inserts whose exclusion checks each wait on the other's
 	// uncommitted row. LockDealership leaves only the same vehicle at two dealerships.
 	deadlockDetected = "40P01"
-	// lockNotAvailable: a lock wait ran past lockTimeout.
+	// lockNotAvailable: a lock wait ran past lockTimeout (repository.go).
 	lockNotAvailable = "55P03"
 )
-
-// lockTimeout bounds every lock wait in a booking transaction, well inside the request
-// deadline, so a queue on a dealership's lock gives a 503 instead of a 500 (D8).
-const lockTimeout = "2s"
 
 // constraintErrors maps each exclusion constraint on appointments to the error the service sees (D8).
 var constraintErrors = map[string]error{
@@ -38,16 +34,12 @@ var constraintErrors = map[string]error{
 // availability reads and insert run one booking at a time and each sees the rows committed
 // before it. Without it, concurrent inserts on one slot each wait on the other's uncommitted
 // row and deadlock, in chains when there are many; Postgres breaks one cycle per second (D8).
-// It first sets lock_timeout for the rest of the transaction; a wait past it is
-// model.ErrLockTimeout. Outside a transaction the lock would be released at once, so that is
-// an error.
+// A wait past lock_timeout (set by InTx) is model.ErrLockTimeout. Outside a transaction the
+// lock would be released at once, so that is an error.
 func (r *Repository) LockDealership(ctx context.Context, dealershipID string) error {
 	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
 	if !ok {
 		return errors.New("lock dealership: no transaction in context")
-	}
-	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '`+lockTimeout+`'`); err != nil {
-		return fmt.Errorf("set lock_timeout: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('dealership/' || $1, 0))`, dealershipID); err != nil {
 		if isCode(err, lockNotAvailable) {
@@ -107,6 +99,9 @@ func (r *Repository) ClaimKey(ctx context.Context, key, hash string, now time.Ti
 		return nil, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
+		if isCode(err, lockNotAvailable) { // the holder kept the key past lock_timeout
+			return nil, model.ErrLockTimeout
+		}
 		return nil, fmt.Errorf("claim key: %w", err)
 	}
 	var stored model.StoredKey

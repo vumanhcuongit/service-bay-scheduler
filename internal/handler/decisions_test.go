@@ -71,7 +71,9 @@ func TestDecisionLines(t *testing.T) {
 		{name: "retry then created", insertErrs: []error{model.ErrTechnicianTaken}, req: req{body: oilAt9},
 			result: "created", retries: 1},
 		{name: "unavailable", insertErrs: []error{model.ErrBayTaken, model.ErrBayTaken},
-			req: req{body: oilAt9}, result: "unavailable", retries: 1},
+			req: req{body: oilAt9}, result: "unavailable", retries: 1, attrs: logLine{"reason": "rerun_failed"}},
+		{name: "lock timeout", insertErrs: []error{model.ErrLockTimeout},
+			req: req{body: oilAt9}, result: "unavailable", attrs: logLine{"reason": "lock_timeout"}},
 		{name: "error", insertErrs: []error{errors.New("boom")}, req: req{body: oilAt9}, result: "error",
 			attrs: logLine{"error": "boom"}},
 	} {

@@ -18,7 +18,8 @@ import (
 )
 
 // The request deadline, not a session setting, bounds DB calls (D12), so it also works
-// behind a transaction-mode pooler (design §8). A held lock must end in a 500, not a hang.
+// behind a transaction-mode pooler (design §8). A held lock must end in a 503 with Retry-After,
+// not a hang, and not a 500: a deadline during a wait is not a fault (D8).
 func TestRequestTimeoutBoundsDBWait(t *testing.T) {
 	ctx := context.Background()
 	pool := testdb.Pool(t)
@@ -47,8 +48,8 @@ func TestRequestTimeoutBoundsDBWait(t *testing.T) {
 
 	select {
 	case rec := <-done:
-		if rec.Code != http.StatusInternalServerError {
-			t.Fatalf("status %d, want 500; body %s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" {
+			t.Fatalf("status %d, Retry-After %q, want 503 and 1; body %s", rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("request still waiting on the lock after 3 s; the 200 ms timeout did not apply")

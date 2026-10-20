@@ -111,7 +111,8 @@ type StoredKey struct {
 var (
 	ErrNotFound = errors.New("not found")
 	// ErrUnavailable is a booking that could not complete under contention: a constraint
-	// violation or deadlock on the re-run too, or a lock wait past the lock timeout (D8).
+	// violation or deadlock on the re-run too, a lock wait past the lock timeout, or the request
+	// deadline passing during a wait (D8).
 	ErrUnavailable     = errors.New("booking unavailable under contention")
 	ErrBayTaken        = errors.New("bay taken")
 	ErrTechnicianTaken = errors.New("technician taken")

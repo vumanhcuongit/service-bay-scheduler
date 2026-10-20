@@ -48,7 +48,12 @@ func (r *Repository) q(ctx context.Context) DB {
 	return r.db
 }
 
+// lockTimeout bounds each lock wait in a transaction (the key row, the dealership lock, a row
+// an insert waits on), so a wait gives a 503 instead of running into the request deadline (D8).
+const lockTimeout = "1s"
+
 // InTx is the only place a transaction starts. Inside an existing one it opens a savepoint.
+// Its first statement sets lock_timeout, before any call in fn can wait on a lock.
 func (r *Repository) InTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	tx, err := r.q(ctx).Begin(ctx)
 	if err != nil {
@@ -56,6 +61,9 @@ func (r *Repository) InTx(ctx context.Context, fn func(ctx context.Context) erro
 	}
 	// Runs on error and on panic; after a successful Commit it is a no-op.
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '`+lockTimeout+`'`); err != nil {
+		return fmt.Errorf("set lock_timeout: %w", err)
+	}
 	if err := fn(context.WithValue(ctx, txKey{}, tx)); err != nil {
 		return err
 	}

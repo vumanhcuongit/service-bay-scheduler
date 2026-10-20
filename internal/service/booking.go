@@ -31,12 +31,30 @@ const minBackoff = 50 * time.Millisecond
 // outcome replays without them (D9). After the 404 and 422 checks the dealership is locked, so
 // its availability reads and inserts run one booking at a time. A 409 is an Outcome, not an
 // error. A constraint violation or deadlock, which the lock leaves only to the same vehicle at
-// two dealerships, gets one re-run, then ErrUnavailable; a lock timeout is ErrUnavailable at once (D8).
-// Each booking logs one decision line (D13).
+// two dealerships, gets one re-run, then ErrUnavailable. A wait cut short, by the lock timeout
+// or by ctx's deadline, is ErrUnavailable at once (D8). Each booking logs one decision line (D13).
 func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
 	out, err := s.book(ctx, req, key)
+	switch {
+	case errors.Is(err, model.ErrLockTimeout):
+		err = fmt.Errorf("%w: %w", model.ErrUnavailable, err)
+	case err != nil && !errors.Is(err, model.ErrUnavailable) && errors.Is(ctx.Err(), context.DeadlineExceeded):
+		// Whatever the call returned, the deadline is the cause: a wait, not a fault.
+		err = fmt.Errorf("%w: %w: %w", model.ErrUnavailable, context.DeadlineExceeded, err)
+	}
 	s.logDecision(ctx, out, err)
 	return out, err
+}
+
+// unavailableReason names why a booking is ErrUnavailable, for its decision line.
+func unavailableReason(err error) string {
+	switch {
+	case errors.Is(err, model.ErrLockTimeout):
+		return "lock_timeout"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	}
+	return "rerun_failed"
 }
 
 // logDecision logs the booking's result. Rejections (404, 422) and failures are left to the
@@ -55,15 +73,12 @@ func (s *Service) logDecision(ctx context.Context, out model.Outcome, err error)
 		s.log.InfoContext(ctx, "booking created", "result", model.ResultCreated, "appointment_id", out.Appointment.ID,
 			"bay_id", out.Appointment.BayID, "technician_id", out.Appointment.TechnicianID)
 	case errors.Is(err, model.ErrUnavailable):
-		s.log.InfoContext(ctx, "booking unavailable after the re-run", "result", model.ResultUnavailable)
+		s.log.InfoContext(ctx, "booking unavailable", "result", model.ResultUnavailable, "reason", unavailableReason(err))
 	}
 }
 
 func (s *Service) book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
 	out, err := s.bookOnce(ctx, req, key)
-	if errors.Is(err, model.ErrLockTimeout) {
-		return model.Outcome{}, fmt.Errorf("%w: %w", model.ErrUnavailable, err)
-	}
 	if !lostRace(err) {
 		return out, err
 	}
@@ -75,8 +90,6 @@ func (s *Service) book(ctx context.Context, req model.BookingRequest, key string
 	}
 	out, err = s.bookOnce(ctx, req, key)
 	switch {
-	case errors.Is(err, model.ErrLockTimeout):
-		return model.Outcome{}, fmt.Errorf("%w: %w", model.ErrUnavailable, err)
 	case errors.Is(err, model.ErrVehicleBusy):
 		// Not stored: this transaction was rolled back. A same-key retry is evaluated again.
 		return conflict(model.ReasonVehicleBusy, fmt.Sprintf("vehicle %s already has an overlapping appointment", req.VehicleID)), nil

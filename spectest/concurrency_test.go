@@ -1,18 +1,25 @@
 package spectest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/handler"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/repository"
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/service"
 )
 
 // make races runs the pool tests 20 times in a row, in make ci and in CI, so a pass is not luck.
@@ -151,33 +158,94 @@ func TestVehicleAtTwoDealerships(t *testing.T) {
 	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 1)
 }
 
-// A booking that waits on the dealership lock past lock_timeout gets a 503, never a 500.
-// The lock is held by another session, as a booking at the same dealership would hold it.
-func TestLockTimeoutIs503(t *testing.T) {
-	e := newPoolEnv(t)
+// holdInOtherSession runs hold in a transaction on its own pool connection, as a concurrent
+// booking would, and returns once hold has run. release ends that transaction, rolled back.
+func holdInOtherSession(t *testing.T, e *env, hold func(r *repository.Repository, ctx context.Context) error) (release func()) {
+	t.Helper()
 	r := repository.New(e.db)
-	held, release := make(chan struct{}), make(chan struct{})
-	done := make(chan error, 1)
+	held, done := make(chan error, 1), make(chan error, 1)
+	stop := make(chan struct{})
 	go func() {
 		done <- r.InTx(context.Background(), func(ctx context.Context) error {
-			if err := r.LockDealership(ctx, "DL1"); err != nil {
+			if err := hold(r, ctx); err != nil {
+				held <- err
 				return err
 			}
-			close(held)
-			<-release
-			return nil
+			held <- nil
+			<-stop
+			return errRolledBack
 		})
 	}()
-	<-held
-	rec := e.book("V1", "OIL", "09:00", key(K5))
-	close(release)
-	if err := <-done; err != nil {
+	if err := <-held; err != nil {
 		t.Fatal(err)
 	}
+	return func() {
+		close(stop)
+		if err := <-done; !errors.Is(err, errRolledBack) {
+			t.Errorf("holding session: %v", err)
+		}
+	}
+}
+
+var errRolledBack = errors.New("rolled back on purpose")
+
+// A booking that waits on the dealership lock past lock_timeout gets a 503, never a 500.
+// The lock is held by another session, as a booking at the same dealership would hold it.
+func TestN39(t *testing.T) {
+	e := newPoolEnv(t)
+	release := holdInOtherSession(t, e, func(r *repository.Repository, ctx context.Context) error {
+		return r.LockDealership(ctx, "DL1")
+	})
+	rec := e.book("V1", "OIL", "09:00", key(K5))
+	release()
 	e.status(rec, http.StatusServiceUnavailable)
 	expect(t, "Retry-After", rec.Header().Get("Retry-After"), "1")
 	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 0)
 	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
+}
+
+// lock_timeout is set before the key claim, so a key held past it is a 503 too, not an
+// unbounded wait.
+func TestHeldKeyIs503(t *testing.T) {
+	e := newPoolEnv(t)
+	release := holdInOtherSession(t, e, func(r *repository.Repository, ctx context.Context) error {
+		_, err := r.ClaimKey(ctx, K5, "other", defaultNow)
+		return err
+	})
+	start := time.Now()
+	rec := e.book("V1", "OIL", "09:00", key(K5))
+	elapsed := time.Since(start)
+	release()
+	e.status(rec, http.StatusServiceUnavailable)
+	expect(t, "Retry-After", rec.Header().Get("Retry-After"), "1")
+	if elapsed > 3*time.Second {
+		t.Errorf("returned after %v, want about the 1 s lock timeout", elapsed)
+	}
+	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 0)
+	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
+}
+
+// A request deadline that passes during a wait, here shorter than lock_timeout, is a 503 with
+// reason deadline, not a 500.
+func TestDeadlineIs503(t *testing.T) {
+	e := newPoolEnv(t)
+	logs := &bytes.Buffer{}
+	log := slog.New(slog.NewTextHandler(logs, nil))
+	svc := service.New(repository.New(e.db), e.clock, log)
+	e.h = handler.New(svc, log, handler.Config{Timeout: 300 * time.Millisecond, Registry: prometheus.NewRegistry()})
+	release := holdInOtherSession(t, e, func(r *repository.Repository, ctx context.Context) error {
+		return r.LockDealership(ctx, "DL1")
+	})
+	rec := e.book("V1", "OIL", "09:00")
+	release()
+	e.status(rec, http.StatusServiceUnavailable)
+	expect(t, "Retry-After", rec.Header().Get("Retry-After"), "1")
+	if !strings.Contains(logs.String(), "result=unavailable reason=deadline") {
+		t.Errorf("no unavailable decision with reason=deadline in:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Errorf("a deadline was logged as an error:\n%s", logs.String())
+	}
 }
 
 func TestVehicleViolationTwiceIs409(t *testing.T) {

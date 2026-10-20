@@ -30,9 +30,10 @@ func TestInTxReleasesConnectionOnPanic(t *testing.T) {
 // A mapping test, not a reproduction: two inserts per transaction force a 40P01 on demand,
 // which no booking does. The deadlock it stands for is the one LockDealership leaves, the same
 // vehicle at two dealerships. Postgres aborts one, and it must reach the service as
-// model.ErrDeadlock, which gets the re-run, not as a 500.
+// model.ErrDeadlock, which gets the re-run, not as a 500. The transactions are opened here, not
+// by InTx: InTx's lock_timeout equals Postgres's default deadlock_timeout and fires first (D8).
 func TestInsertAppointmentMapsDeadlock(t *testing.T) {
-	r := repository.New(testdb.Pool(t))
+	pool := testdb.Pool(t)
 	ctx := context.Background()
 	at := func(dealership, serviceType, vehicle, bay, tech string, hour int) model.Appointment {
 		start := time.Date(2026, 10, 21, hour, 0, 0, 0, time.UTC)
@@ -44,15 +45,23 @@ func TestInsertAppointmentMapsDeadlock(t *testing.T) {
 	}
 	errs := make(chan error, 2)
 	run := func(first, second model.Appointment, mine, theirs chan struct{}) {
-		errs <- r.InTx(ctx, func(ctx context.Context) error {
+		errs <- func() error {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			r := repository.New(tx) // no lock_timeout, so the deadlock detector decides
 			if _, err := r.InsertAppointment(ctx, first); err != nil {
 				return err
 			}
 			close(mine)
 			<-theirs
-			_, err := r.InsertAppointment(ctx, second) // waits on the other's first row
-			return err
-		})
+			if _, err := r.InsertAppointment(ctx, second); err != nil { // waits on the other's first row
+				return err
+			}
+			return tx.Commit(ctx)
+		}()
 	}
 	a, b := make(chan struct{}), make(chan struct{})
 	go run(at("DL1", "OIL", "V1", "B1", "T1", 2), at("DL1", "OIL", "V2", "B2", "T2", 3), a, b)
