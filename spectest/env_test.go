@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -56,15 +57,25 @@ type opt func(*request)
 
 func extra(m map[string]any) opt { return func(r *request) { r.extra = m } }
 
-// startAt turns "09:00" or "09:00:30" into Day local time; anything longer is used as given.
+// raw sends body as is, in place of the four fields.
+func raw(body string) opt { return func(r *request) { r.raw = &body } }
+
+// dealership books at id instead of DL1; dl2 is the spec's book@DL2.
+func dealership(id string) opt { return func(r *request) { r.dealership = id } }
+
+func dl2() opt { return dealership("DL2") }
+
+var clockTime = regexp.MustCompile(`^\d\d:\d\d(:\d\d)?$`)
+
+// startAt turns "09:00" or "09:00:30" into Day local time; anything else is used as given.
 func startAt(at string) string {
-	switch len(at) {
-	case 5:
+	switch {
+	case !clockTime.MatchString(at):
+		return at
+	case len(at) == 5:
 		return day + "T" + at + ":00+07:00"
-	case 8:
-		return day + "T" + at + "+07:00"
 	}
-	return at
+	return day + "T" + at + "+07:00"
 }
 
 // book is the spec's book(V, S, t): POST /appointments for DL1 unless dl2() is given.
@@ -165,9 +176,49 @@ func (e *env) status(r *httptest.ResponseRecorder, code int) {
 	}
 }
 
+// conflict asserts a 409 with reason.
+func (e *env) conflict(r *httptest.ResponseRecorder, reason string) {
+	e.t.Helper()
+	e.status(r, http.StatusConflict)
+	var b struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(r.Body.Bytes(), &b); err != nil {
+		e.t.Fatalf("decode 409 body %q: %v", r.Body.String(), err)
+	}
+	if b.Reason != reason {
+		e.t.Fatalf("reason %q, want %q; body %s", b.Reason, reason, r.Body.String())
+	}
+}
+
+// message returns the "message" field of an error body.
+func (e *env) message(r *httptest.ResponseRecorder) string {
+	e.t.Helper()
+	var b struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(r.Body.Bytes(), &b); err != nil {
+		e.t.Fatalf("decode error body %q: %v", r.Body.String(), err)
+	}
+	return b.Message
+}
+
 func expect[T comparable](t *testing.T, name string, got, want T) {
 	t.Helper()
 	if got != want {
 		t.Errorf("%s = %v, want %v", name, got, want)
+	}
+}
+
+// TestStartAt guards the helper itself: only HH:MM and HH:MM:SS are expanded, so N29's
+// "tomorrow" (8 characters, like "09:00:30") reaches the service as sent.
+func TestStartAt(t *testing.T) {
+	for in, want := range map[string]string{
+		"09:00":            "2026-10-21T09:00:00+07:00",
+		"09:00:30":         "2026-10-21T09:00:30+07:00",
+		"tomorrow":         "tomorrow",
+		"2026-10-21T09:00": "2026-10-21T09:00",
+	} {
+		expect(t, "startAt("+in+")", startAt(in), want)
 	}
 }

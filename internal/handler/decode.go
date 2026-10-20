@@ -2,7 +2,9 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"time"
@@ -10,30 +12,75 @@ import (
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 )
 
+// maxBodyBytes caps a booking body.
+const maxBodyBytes = 1 << 20
+
+// startLayouts are tried in order. The second takes a start without seconds, e.g. 2026-10-21T02:00Z (M10).
+// Both require an offset (N30).
+var startLayouts = []string{time.RFC3339Nano, "2006-01-02T15:04Z07:00"}
+
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 func isUUID(s string) bool { return uuidPattern.MatchString(s) }
 
-// decodeBookingRequest reads the four schema fields; unknown fields are ignored (D9).
-// Task 4 adds the full 400 rules.
+// decodeBookingRequest reads exactly one JSON object with the four schema fields, each a
+// non-empty string; unknown fields are ignored (D9). An error is a 400 naming the field.
 func decodeBookingRequest(r *http.Request) (model.BookingRequest, error) {
-	var body struct {
-		DealershipID  string `json:"dealership_id"`
-		VehicleID     string `json:"vehicle_id"`
-		ServiceTypeID string `json:"service_type_id"`
-		Start         string `json:"start"`
+	var fields map[string]json.RawMessage
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBodyBytes))
+	if err := dec.Decode(&fields); err != nil || fields == nil {
+		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
+			return model.BookingRequest{}, fmt.Errorf("body must be at most %d bytes", tooLarge.Limit)
+		}
+		return model.BookingRequest{}, errors.New("body must be a JSON object")
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		return model.BookingRequest{}, fmt.Errorf("body must be a JSON object: %w", err)
+	if _, err := dec.Token(); err != io.EOF {
+		return model.BookingRequest{}, errors.New("body must be a single JSON object")
 	}
-	start, err := time.Parse(time.RFC3339Nano, body.Start)
+
+	var req model.BookingRequest
+	for _, f := range []struct {
+		name string
+		dst  *string
+	}{
+		{"dealership_id", &req.DealershipID},
+		{"vehicle_id", &req.VehicleID},
+		{"service_type_id", &req.ServiceTypeID},
+	} {
+		s, err := stringField(fields, f.name)
+		if err != nil {
+			return model.BookingRequest{}, err
+		}
+		*f.dst = s
+	}
+	start, err := stringField(fields, "start")
 	if err != nil {
-		return model.BookingRequest{}, fmt.Errorf("start must be RFC 3339 with an offset")
+		return model.BookingRequest{}, err
 	}
-	return model.BookingRequest{
-		DealershipID:  body.DealershipID,
-		VehicleID:     body.VehicleID,
-		ServiceTypeID: body.ServiceTypeID,
-		Start:         start,
-	}, nil
+	if req.Start, err = parseStart(start); err != nil {
+		return model.BookingRequest{}, err
+	}
+	return req, nil
+}
+
+// stringField returns fields[name] if it is present, a JSON string, and not empty.
+func stringField(fields map[string]json.RawMessage, name string) (string, error) {
+	v, ok := fields[name]
+	if !ok {
+		return "", fmt.Errorf("%s is required", name)
+	}
+	var s *string // null decodes to nil
+	if err := json.Unmarshal(v, &s); err != nil || s == nil || *s == "" {
+		return "", fmt.Errorf("%s must be a non-empty string", name)
+	}
+	return *s, nil
+}
+
+func parseStart(s string) (time.Time, error) {
+	for _, layout := range startLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, errors.New("start must be RFC 3339 with an offset")
 }
