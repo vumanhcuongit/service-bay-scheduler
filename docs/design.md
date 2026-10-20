@@ -92,11 +92,11 @@ Happy path, with a key:
 
 1. Request-id middleware sets the id. Access middleware logs the request in and starts the latency timer.
 2. Handler decodes and validates the body. Malformed → **400**, nothing touched in the DB.
-3. Domain opens a transaction and inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9; 1.1 row 6).
+3. Domain opens a transaction; its first statement sets `lock_timeout` to 1 s, so every lock wait from here on is bounded. It inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9; 1.1 row 6), for at most 1 s; longer → **503** with `Retry-After: 1`.
 4. No existing row (or one older than 24 h) → continue as new.
 5. Domain loads dealership, vehicle, service type. Unknown → **404**, rollback (key row goes too).
 6. Domain checks the request against the rules: aligned, `start > now`, inside hours, service type belongs to dealership. Fails → **422**, rollback (1.1 row 5).
-7. Domain reads the dealership's bays and qualified technicians, then takes the dealership's advisory lock, with or without a key. It is held until commit or rollback, so from here to the commit the dealership's bookings run one at a time (§5); a 404 or 422 never waits on it. A wait past `lock_timeout` (2 s) → **503** with `Retry-After: 1`, no re-run. Any key was claimed at step 3, so the key lock always comes first and the two cannot form a cycle. Then the domain checks the vehicle, then bays, then technicians, using the rules in D4–D7 (1.1 rows 3–5). First failure becomes the 409 reason.
+7. Domain reads the dealership's bays and qualified technicians, then takes the dealership's advisory lock, with or without a key. It is held until commit or rollback, so from here to the commit the dealership's bookings run one at a time (§5); a 404 or 422 never waits on it. A wait past `lock_timeout` (1 s) → **503** with `Retry-After: 1`, no re-run. Any key was claimed at step 3, so the key lock always comes first and the two cannot form a cycle. Then the domain checks the vehicle, then bays, then technicians, using the rules in D4–D7 (1.1 rows 3–5). First failure becomes the 409 reason.
 8. Domain picks the first free bay and first free qualified technician by id and inserts the appointment.
 9. Domain writes the result onto the key row and commits. Key row and appointment land together (1.1 row 8).
 10. Handler returns **201**. Access middleware logs the result and records metrics.
@@ -120,7 +120,7 @@ A side effect worth knowing: while A waits for its re-run, its key row doesn't e
 
 Without a key, the key claim in steps 3–4 and the key write in step 9 are skipped. The dealership lock in step 7 is still taken; the rest is the same.
 
-Any other error (DB timeout, lost connection) → rollback, **500**, nothing stored.
+If the 5 s request deadline passes during any wait, the domain returns "unavailable" with `reason=deadline`: rollback, **503** with `Retry-After: 1`, nothing stored. The waits are bounded one by one, but they can add up, so the deadline is the real bound (D8). Any other error (lost connection, a failing query) → rollback, **500**, nothing stored.
 
 ## 5. Data model
 
@@ -207,7 +207,7 @@ The transaction runs at Postgres's default `READ COMMITTED`. Correctness doesn't
 - Switch when: middleware per route group gets messy.
 
 **DB driver: `pgx`.**
-- Why: it exposes the constraint name on errors, which the repository needs to tell bay, technician and vehicle violations apart.
+- Why: it exposes the constraint name on errors, which the repository needs to tell bay, technician and vehicle violations apart. The repository also caches `time.LoadLocation` per timezone name, so a booking does not reload its dealership's zone.
 - Considered: `database/sql` + `lib/pq`.
 - Switch when: not expected.
 
@@ -260,7 +260,7 @@ Rough sizing for 1000 dealerships, ~10 bays each, ~15 jobs per bay per day: abou
 2. **Database connections.** Several instances × a pool each runs into Postgres's connection limit before CPU. Change: small pools, plus a pooler (PgBouncer or RDS Proxy) in transaction mode. That works here because nothing relies on session state.
 3. **`idempotency_keys` growth.** Without cleanup, expiry would be lazy (an old row is overwritten only when the same key comes back) and most rows would stay forever. Already planned (D9): a periodic `DELETE … WHERE created_at < now() - interval '24 hours'`, run as a scheduled task outside the service (ECS scheduled task or cron; locally a make target). Not a loop in each instance: N instances would run it N times. At this volume that is ~150k rows a day, a small delete. If it ever isn't, batch the delete or partition the table by day and drop old partitions.
 4. **`appointments` grows forever.** Fine for years at this volume with an index on `(dealership_id, start)`. Change, much later: partition by month, or move past appointments to an archive table.
-5. **Hot dealership contention.** Each dealership is serialised: its availability reads and inserts take one lock and run one booking at a time. Measured on localhost, ten serialised bookings took 0.12–0.15 s, about 70 a second per dealership; that is an estimate for production, where the database is a network hop away. It is still well above the under-10-a-second peak for all 1000 dealerships together, and dealerships don't share a lock, so adding dealerships doesn't make it worse. The cost to watch: a booking waiting on the lock holds a pool connection, so the queue per dealership is bounded by `lock_timeout` × pool size, and a hot dealership can fill a shared pool and starve the others. Mitigation, out of scope: a pool per dealership, or a queue in front of booking. Change, if one dealership's lock wait shows in latency: lock per resource (§6).
+5. **Hot dealership contention.** Each dealership is serialised: its availability reads and inserts take one lock and run one booking at a time. Measured on localhost, ten serialised bookings took 0.12–0.15 s, about 70 a second per dealership; that is an estimate for production, where the database is a network hop away. It is still well above the under-10-a-second peak for all 1000 dealerships together, and dealerships don't share a lock, so adding dealerships doesn't make it worse. The cost to watch: a booking waiting on the lock holds a pool connection. A blocked dealership holds its waiters for one `lock_timeout` window (1 s), and how many wait at once is bounded by the pool size, so a hot dealership can fill a shared pool and starve the others. Mitigation, out of scope: a pool per dealership, or a queue in front of booking. Change, if one dealership's lock wait shows in latency: lock per resource (§6).
 
 I would not add a cache for availability. The point of "real-time" in decisions.md §0.3 is that the answer reflects the database at request time, and the reads above are cheap once batched.
 
