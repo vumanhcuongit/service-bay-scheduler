@@ -88,6 +88,9 @@ var (
 	ErrBayTaken        = errors.New("bay taken")
 	ErrTechnicianTaken = errors.New("technician taken")
 	ErrVehicleBusy     = errors.New("vehicle busy")
+	// ErrDeadlock is two bookings whose exclusion checks waited on each other; Postgres
+	// aborted this one. Like ErrBayTaken it is a lost race, so the booking retries (D8).
+	ErrDeadlock = errors.New("deadlocked with a concurrent booking")
 )
 
 // NotFoundError names a well-formed reference that does not exist (404).

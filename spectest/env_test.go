@@ -57,6 +57,12 @@ func newPoolEnv(t *testing.T) *env {
 	return newEnvOn(t, testdb.Pool(t), nil)
 }
 
+// newPoolEnvWith is newPoolEnv with the repository wrapped.
+func newPoolEnvWith(t *testing.T, wrap func(service.Repository) service.Repository) *env {
+	t.Helper()
+	return newEnvOn(t, testdb.Pool(t), wrap)
+}
+
 func newEnvOn(t *testing.T, db repository.DB, wrap func(service.Repository) service.Repository) *env {
 	t.Helper()
 	clk := clock.NewFixed(defaultNow)

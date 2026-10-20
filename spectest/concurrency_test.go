@@ -120,6 +120,40 @@ func TestVehicleViolationTwiceIs409(t *testing.T) {
 	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
 }
 
+// A lost race retries in a fresh transaction that claims the key again, so the 201 is stored
+// once and replays. A deadlock between concurrent inserts is such a lost race.
+func TestLostRaceRetriesWithKey(t *testing.T) {
+	for _, lost := range []error{model.ErrBayTaken, model.ErrTechnicianTaken, model.ErrDeadlock} {
+		t.Run(lost.Error(), func(t *testing.T) {
+			f := &flakyRepo{failures: 1, err: lost}
+			e := newEnvWith(t, f.wrap)
+			r1 := e.book("V1", "OIL", "09:00", key(K5))
+			e.created(r1, "B1", "T1")
+			expect(t, "failed inserts", f.inserts, 1)
+			expect(t, "created key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1 AND status = 'created'", K5), 1)
+			r2 := e.book("V1", "OIL", "09:00", key(K5))
+			expect(t, "replayed body", r2.Body.String(), r1.Body.String())
+		})
+	}
+}
+
+// The usual vehicle violation: the other booking has committed by the time ours hits the
+// constraint, so the immediate re-run's fresh check returns the 409, which is stored and replays.
+func TestVehicleViolationRerunStores409(t *testing.T) {
+	f := &flakyRepo{failures: 1, err: model.ErrVehicleBusy}
+	e := newPoolEnvWith(t, f.wrap)
+	f.onInsert = func() {
+		if f.inserts == 1 {
+			e.given("V1", "OIL", "09:00", "B2", "T2") // commits on its own connection
+		}
+	}
+	r1 := e.book("V1", "OIL", "09:00", key(K5))
+	e.conflict(r1, "vehicle_busy")
+	expect(t, "conflict key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1 AND status = 'conflict'", K5), 1)
+	r2 := e.book("V1", "OIL", "09:00", key(K5))
+	expect(t, "replayed body", r2.Body.String(), r1.Body.String())
+}
+
 // A request cancelled during the backoff stops waiting at once and does not try again.
 func TestBackoffStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

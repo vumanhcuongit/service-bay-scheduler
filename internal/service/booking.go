@@ -46,7 +46,7 @@ func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string
 				return conflict(model.ReasonVehicleBusy, fmt.Sprintf("vehicle %s already has an overlapping appointment", req.VehicleID)), nil
 			}
 			vehicleRerun = true
-		case errors.Is(err, model.ErrBayTaken), errors.Is(err, model.ErrTechnicianTaken):
+		case errors.Is(err, model.ErrBayTaken), errors.Is(err, model.ErrTechnicianTaken), errors.Is(err, model.ErrDeadlock):
 			if attempt == maxAttempts {
 				return model.Outcome{}, model.ErrUnavailable
 			}

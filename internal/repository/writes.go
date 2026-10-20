@@ -13,8 +13,13 @@ import (
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 )
 
-// exclusionViolation is SQLSTATE exclusion_violation.
-const exclusionViolation = "23P01"
+// SQLSTATEs InsertAppointment maps to lost races.
+const (
+	exclusionViolation = "23P01"
+	// deadlockDetected: two inserts whose exclusion checks each wait on the other's
+	// uncommitted row. The dealership lock leaves only the same vehicle at two dealerships.
+	deadlockDetected = "40P01"
+)
 
 // constraintErrors maps each exclusion constraint on appointments to the error the service sees (D8).
 var constraintErrors = map[string]error{
@@ -23,7 +28,15 @@ var constraintErrors = map[string]error{
 	"appointments_vehicle_excl":    model.ErrVehicleBusy,
 }
 
+// InsertAppointment first takes the dealership's insert lock until the transaction ends.
+// Without it, concurrent inserts on one slot each wait on the other's uncommitted row and
+// deadlock, in chains when there are many; Postgres breaks one cycle per second. With it they
+// queue, and each sees the rows committed before it. Checks still race: the constraints stay
+// the guard, and a loser still gets 23P01 and retries (D8).
 func (r *Repository) InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error) {
+	if _, err := r.q(ctx).Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('appointments/' || $1, 0))`, a.DealershipID); err != nil {
+		return model.Appointment{}, fmt.Errorf("lock dealership inserts: %w", err)
+	}
 	err := r.q(ctx).QueryRow(ctx, `
 		INSERT INTO appointments
 			(dealership_id, customer_id, vehicle_id, service_type_id, bay_id, technician_id, start, "end", status)
@@ -33,9 +46,14 @@ func (r *Repository) InsertAppointment(ctx context.Context, a model.Appointment)
 		Scan(&a.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == exclusionViolation {
-			if mapped, ok := constraintErrors[pgErr.ConstraintName]; ok {
-				return model.Appointment{}, mapped
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case exclusionViolation:
+				if mapped, ok := constraintErrors[pgErr.ConstraintName]; ok {
+					return model.Appointment{}, mapped
+				}
+			case deadlockDetected:
+				return model.Appointment{}, model.ErrDeadlock
 			}
 		}
 		return model.Appointment{}, fmt.Errorf("insert appointment: %w", err)
