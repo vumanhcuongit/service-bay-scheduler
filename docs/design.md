@@ -92,12 +92,12 @@ Happy path, with a key:
 
 1. Request-id middleware sets the id. Access middleware logs the request in and starts the latency timer.
 2. Handler decodes and validates the body. Malformed → **400**, nothing touched in the DB.
-3. Domain opens a transaction; its first statement sets `lock_timeout` to 1 s, so every lock wait from here on is bounded. It inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9; 1.1 row 6), for at most 1 s; longer → **503** with `Retry-After: 1`.
+3. Domain opens a transaction; its first statement sets `lock_timeout` to 1 s, so every lock wait from here on is bounded (the insert at step 8 raises it to 2 s, D8). It inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9; 1.1 row 6), for at most 1 s; longer → **503** with `Retry-After: 1`.
 4. No existing row (or one older than 24 h) → continue as new.
 5. Domain loads dealership, vehicle, service type. Unknown → **404**, rollback (key row goes too).
 6. Domain checks the request against the rules: aligned, `start > now`, inside hours, service type belongs to dealership. Fails → **422**, rollback (1.1 row 5).
 7. Domain reads the dealership's bays and qualified technicians, then takes the dealership's advisory lock, with or without a key. It is held until commit or rollback, so from here to the commit the dealership's bookings run one at a time (§5); a 404 or 422 never waits on it. A wait past `lock_timeout` (1 s) → **503** with `Retry-After: 1`, no re-run. Any key was claimed at step 3, so the key lock always comes first and the two cannot form a cycle. Then the domain checks the vehicle, then bays, then technicians, using the rules in D4–D7 (1.1 rows 3–5). First failure becomes the 409 reason.
-8. Domain picks the first free bay and first free qualified technician by id and inserts the appointment.
+8. Domain picks the first free bay and first free qualified technician by id and inserts the appointment. The insert's row wait is the one that can deadlock, so it gets a 2 s `lock_timeout`, longer than Postgres's 1 s `deadlock_timeout`; with an equal value the detector never picks a victim and both sides lose (D8).
 9. Domain writes the result onto the key row and commits. Key row and appointment land together (1.1 row 8).
 10. Handler returns **201**. Access middleware logs the result and records metrics.
 
