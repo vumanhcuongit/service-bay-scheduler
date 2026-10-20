@@ -78,7 +78,11 @@ func TestDecisionLines(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			e := newObsEnvWith(t, c.insertErrs)
 			for _, s := range c.setup {
-				e.post(s.body, map[string]string{"Idempotency-Key": s.key})
+				h := map[string]string{}
+				if s.key != "" { // an empty header is a 400, not "no key"
+					h["Idempotency-Key"] = s.key
+				}
+				e.post(s.body, h)
 			}
 			before := e.counts(t)
 			e.logs.Reset()

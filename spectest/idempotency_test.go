@@ -83,6 +83,18 @@ func TestN23(t *testing.T) {
 	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 0)
 }
 
+// Red-team pass 2: an empty Idempotency-Key header is a 400, not a request without a key.
+func TestEmptyKey(t *testing.T) {
+	e := newEnv(t)
+	body := `{"dealership_id":"DL1","vehicle_id":"V1","service_type_id":"OIL","start":"` + startAt("09:00") + `"}`
+	r := e.do(http.MethodPost, "/appointments", body, map[string]string{"Idempotency-Key": ""})
+	e.status(r, http.StatusBadRequest)
+	if msg := e.message(r); !strings.EqualFold(msg, "idempotency-key must be a uuid") {
+		t.Errorf("message %q, want idempotency-key must be a uuid", msg)
+	}
+	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 0)
+}
+
 // Review Focus 3: the uuid column makes upper and lower case the same key. K1 is all
 // digits, so this uses a key with letters in it.
 func TestKeyCaseInsensitive(t *testing.T) {
