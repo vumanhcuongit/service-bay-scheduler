@@ -73,10 +73,12 @@ func TestBookingMetrics(t *testing.T) {
 		headers map[string]string
 		code    int
 	}{
-		{oilAt9, k, http.StatusCreated},    // created
-		{oilAt9, k, http.StatusCreated},    // replayed
-		{oilAt9, nil, http.StatusConflict}, // conflict: vehicle_busy
-		{`{`, nil, http.StatusBadRequest},  // invalid
+		{oilAt9, k, http.StatusCreated},                                                           // created
+		{oilAt9, k, http.StatusCreated},                                                           // replayed
+		{oilAt9, nil, http.StatusConflict},                                                        // conflict: vehicle_busy
+		{`{`, nil, http.StatusBadRequest},                                                         // invalid
+		{strings.Replace(oilAt9, "DL1", "DL9", 1), nil, http.StatusNotFound},                      // invalid
+		{strings.Replace(oilAt9, "09:00:00", "09:05:00", 1), nil, http.StatusUnprocessableEntity}, // invalid
 	} {
 		if rec := e.post(c.body, c.headers); rec.Code != c.code {
 			t.Fatalf("status %d, want %d; body %s", rec.Code, c.code, rec.Body.String())
@@ -84,7 +86,7 @@ func TestBookingMetrics(t *testing.T) {
 	}
 	e.get("/healthz") // not a booking: counted nowhere
 
-	want := map[string]float64{"created": 1, "replayed": 1, "conflict": 1, "invalid": 1, "unavailable": 0, "error": 0}
+	want := map[string]float64{"created": 1, "replayed": 1, "conflict": 1, "invalid": 3, "unavailable": 0, "error": 0}
 	for _, m := range gather(t, e.reg, "booking_attempts_total") {
 		result := m["result"].(string)
 		if m["value"].(float64) != want[result] {
@@ -98,8 +100,8 @@ func TestBookingMetrics(t *testing.T) {
 	if n, err := testutil.GatherAndCount(e.reg, "booking_latency_seconds"); err != nil || n != 1 {
 		t.Fatalf("booking_latency_seconds series = %d, %v", n, err)
 	}
-	if got := gather(t, e.reg, "booking_latency_seconds")[0]["count"]; got != float64(4) {
-		t.Errorf("booking_latency_seconds sample count = %v, want 4", got)
+	if got := gather(t, e.reg, "booking_latency_seconds")[0]["count"]; got != float64(6) {
+		t.Errorf("booking_latency_seconds sample count = %v, want 6", got)
 	}
 }
 
@@ -180,4 +182,20 @@ func TestMetricsEndpoint(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `booking_attempts_total{result="created"} 0`) {
 		t.Fatalf("GET /metrics = %d %s", rec.Code, rec.Body.String())
 	}
+}
+
+// A 400 never reaches the service, so the handler logs its decision line (design §7).
+func TestBadRequestLogsDecision(t *testing.T) {
+	e := newObsEnv(t)
+	e.post(`{"dealership_id":"DL1"}`, map[string]string{"X-Request-ID": "R4"})
+	for _, l := range strings.Split(strings.TrimSpace(e.logs.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("log line %q: %v", l, err)
+		}
+		if m["result"] == "invalid" && m["request_id"] == "R4" && m["message"] == "vehicle_id is required" {
+			return
+		}
+	}
+	t.Fatalf("no invalid decision line with the 400 message:\n%s", e.logs.String())
 }

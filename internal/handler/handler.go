@@ -57,6 +57,8 @@ func (h *handler) handleCreateAppointment(w http.ResponseWriter, r *http.Request
 	req, err := decodeBookingRequest(r)
 	if err != nil {
 		info.Result = "invalid"
+		// The service never sees a 400, so its decision line is logged here (design §7).
+		h.log.InfoContext(r.Context(), "booking rejected", "result", "invalid", "message", err.Error())
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

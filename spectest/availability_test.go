@@ -120,3 +120,16 @@ func TestAvailabilityBadParams(t *testing.T) {
 		}
 	}
 }
+
+// Near now, availability lists exactly what booking accepts (rule 12): at 12:00 the 12:00
+// start is a 422, so the first listed start is 12:15.
+func TestAvailabilityStartsAfterNow(t *testing.T) {
+	e := newEnv(t)
+	code, starts := e.avail("OIL", "2026-10-20")
+	expect(t, "status", code, http.StatusOK)
+	if want := every("12:15", "16:30"); !slices.Equal(starts, want) {
+		t.Fatalf("starts %v, want %v", starts, want)
+	}
+	e.status(e.book("V1", "OIL", "2026-10-20T12:00:00+07:00"), http.StatusUnprocessableEntity)
+	e.created(e.book("V1", "OIL", "2026-10-20T12:15:00+07:00"), "B1", "T1")
+}
