@@ -2,8 +2,6 @@
 
 For a reader evaluating the architecture. Behaviour lives in the [booking spec](superpowers/specs/2026-10-20-booking.md), rules and their reasons in [decisions.md](decisions.md) (D-numbers), API shapes in [openapi.yaml](../openapi.yaml). This file explains how the pieces fit and why; it does not repeat them.
 
-Items marked **Unsure** are not settled in decisions.md. They are my current lean, not a decision.
-
 ---
 
 ## 1. Problem
@@ -24,7 +22,7 @@ A booking system earns trust by never doing a small number of things. This desig
 | A job given to someone who cannot do it | technicians are filtered by the service's required skill before any are considered | §4 step 7, D3, D4 | [N14](../spectest/conflict_test.go), [N15](../spectest/conflict_test.go) |
 | A job that runs past closing time, or past the technician's shift | the whole `[start, end)` must fit inside the dealership's hours and the technician's window | §4 steps 6–7, D2, D4 | [N1–N3](../spectest/time_test.go), [N16](../spectest/conflict_test.go) |
 | A customer who retries ends up with two appointments | the idempotency key is claimed inside the same transaction as the booking; a retry replays the first answer | §4, D9 | [M15](../spectest/idempotency_test.go), [M17](../spectest/concurrency_test.go) |
-| A customer turned away while another bay was free | a lost race is retried with a fresh look at the calendar, up to three times | §4, D8 | [M25](../spectest/concurrency_test.go) |
+| A customer turned away while another bay was free | the dealership lock runs its bookings one at a time, so every check sees the bookings committed before it and a second bay is never lost to a race. The fresh look at the calendar a retry used to give is no longer needed | §4, §5, D8 | [M25](../spectest/concurrency_test.go), [TenRacers](../spectest/concurrency_test.go) |
 | A booking saved without its key, or a key saved without its booking | both rows commit or roll back together; nothing is written outside the transaction | §4, §5, D9 | [N38](../spectest/concurrency_test.go) |
 
 ## 2. Architecture
@@ -42,7 +40,7 @@ flowchart TB
             rid --> acc --> h
         end
         subgraph domain["Domain"]
-            book["booking service<br/>key lookup, 404/422/409 rules,<br/>assignment, retry loop"]
+            book["booking service<br/>key lookup, dealership lock,<br/>404/422/409 rules, assignment, one re-run"]
             avail["availability<br/>same free-slot rule as booking"]
             clock["clock (injected)"]
         end
@@ -76,7 +74,7 @@ The request-id middleware (★, highlighted) is the outermost layer, so every lo
 
 **Handlers.** Decode JSON, run the 400 checks (missing fields, types, offset on `start`, key format), call the domain, and turn the domain result into a status code and body. They must not know about bays, technicians, hours or SQL. All they know is "domain returned created / conflict(reason) / invalid / not found / unavailable".
 
-**Booking service (domain).** Owns the check order after 400 (key lookup → 404 → 422 → 409), the assignment rule (D7), and the retry loop (D8). It reads time only from the injected clock. It must not know about HTTP status codes, headers or SQL error codes; it sees `ErrBayTaken`, `ErrTechnicianTaken`, `ErrVehicleBusy` from the repository, not SQLSTATE `23P01`.
+**Booking service (domain).** Owns the check order after 400 (key lookup → dealership lock → 404 → 422 → 409), the assignment rule (D7), and the one defensive re-run (D8). It reads time only from the injected clock. It must not know about HTTP status codes, headers or SQL error codes; it sees `ErrBayTaken`, `ErrTechnicianTaken`, `ErrVehicleBusy` from the repository, not SQLSTATE `23P01`.
 
 **Availability (domain).** Answers `GET /availability` with the same "is this bay / technician free for `[start, end)`" rule the booking uses, so the list and the booking cannot disagree (spec rule 12). It must not know about vehicles or idempotency.
 
@@ -95,7 +93,7 @@ Happy path, with a key:
 1. Request-id middleware sets the id. Access middleware logs the request in and starts the latency timer.
 2. Handler decodes and validates the body. Malformed → **400**, nothing touched in the DB.
 3. Domain opens a transaction and inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9; 1.1 row 6).
-4. No existing row (or one older than 24 h) → continue as new.
+4. No existing row (or one older than 24 h) → continue as new. Domain takes the dealership's advisory lock, held until commit or rollback; from here on, the dealership's bookings run one at a time (§5). The key is always claimed first, so the two locks are always taken in the same order and cannot form a cycle.
 5. Domain loads dealership, vehicle, service type. Unknown → **404**, rollback (key row goes too).
 6. Domain checks the request against the rules: aligned, `start > now`, inside hours, service type belongs to dealership. Fails → **422**, rollback (1.1 row 5).
 7. Domain checks the vehicle, then bays, then technicians, using the rules in D4–D7 (1.1 rows 3–5). First failure becomes the 409 reason.
@@ -105,16 +103,14 @@ Happy path, with a key:
 
 **409 path.** Step 7 finds a blocker (`vehicle_busy`, `no_bay` or `no_technician`). The domain writes the 409 result onto the key row and commits the key row alone. Handler returns **409** with the reason. A retry with the same key replays the same 409.
 
-**Retry-then-503 path.** Two requests pass step 7 for the same bay or technician; one wins the insert at step 8, the other hits an exclusion violation.
+**Re-run-then-503 path.** Within one dealership this cannot start: the lock means no other booking there inserts between this one's check and its insert. What is left is the same vehicle booked at two dealerships at once. Each holds only its own dealership's lock, both pass step 7, and one insert hits the vehicle constraint or a deadlock with the other.
 
 1. Postgres aborts the loser's transaction; everything in it, including its key row, is gone.
-2. Repository maps the violation to `ErrBayTaken` or `ErrTechnicianTaken`.
-3. Domain waits a short random 50–100 ms, then starts a new transaction and re-runs from step 3. The fresh check either finds another candidate, or a real 409 (1.1 row 7). The random wait keeps two losers from colliding again on the same next candidate.
-4. After 3 attempts in total, the domain returns "unavailable". Handler returns **503** with `Retry-After: 1`. Nothing is stored, so the client's retry with the same key runs as new.
+2. Repository maps the violation to `ErrVehicleBusy` (or `ErrBayTaken`, `ErrTechnicianTaken`), or a deadlock to `ErrDeadlock`.
+3. Domain waits a short random 50–100 ms, then starts a new transaction and re-runs once from step 3. By then the other booking has normally committed, so the fresh check at step 7 returns `vehicle_busy` and stores it on the key row like any other 409.
+4. If the re-run hits the vehicle constraint again, the domain returns **409** `vehicle_busy` without storing it. Any other violation or deadlock on the re-run → "unavailable": handler returns **503** with `Retry-After: 1`. Nothing is stored, so the client's retry with the same key runs as new. Never 500.
 
-A vehicle violation at step 8 is different: no other candidate can fix it, so it goes straight to **409** `vehicle_busy` with no retry (D8). In code, "straight" is one immediate re-run with no backoff: the violation means the other booking has committed, so the fresh check at step 7 returns `vehicle_busy` and stores it on the key row like any other 409. If that re-run hits the vehicle constraint again, the domain returns **409** `vehicle_busy` without storing it, never 500.
-
-A side effect worth knowing: while A is between attempts, its key row doesn't exist. A same-key request B that was waiting on it runs as new, and A's next attempt then waits on B's key row and replays B's result. The outcome is still one booking per key.
+A side effect worth knowing: while A waits for its re-run, its key row doesn't exist. A same-key request B that was waiting on it runs as new, and A's re-run then waits on B's key row and replays B's result. The outcome is still one booking per key.
 
 **Idempotent replay path.** Step 3 finds a committed, fresh key row.
 
@@ -164,6 +160,8 @@ EXCLUDE USING gist (vehicle_id    WITH =, tstzrange(start, "end") WITH &&)
 
 **Why the database is the final guard.** The domain check in step 7 runs before the insert, so two requests can both see a free bay and both try to take it. Any check in Go has this gap, and an in-process lock doesn't help once there are two instances. The exclusion constraint closes it: Postgres rejects the second overlapping row no matter which instance or code path wrote it. The domain check is still there, but its job is to produce a clear 409 reason, not to keep the calendar correct. Reasoning and alternatives: D8.
 
+**Why there is also a lock.** The constraint alone keeps the calendar correct but not live. Concurrent inserts that clash on an exclusion constraint each wait on the other's uncommitted row and deadlock; under contention they deadlock in chains, Postgres breaks one cycle per second, and losers ran past the request deadline into 500s (`ceb8c6d`). So the booking takes a per-dealership advisory lock right after claiming its key, before any check. A dealership's bookings then run one at a time, each check sees every booking committed before it, and the 409 it gives is the final answer. Both are needed: the lock is a convention every booking path must follow, so it can't be the correctness guard; the constraint can't be bypassed, but on its own it deadlocks under load. The lock is the liveness guard, the constraint the correctness guard. The one race the lock can't cover, the same vehicle at two dealerships, is left to the constraint and the one re-run in §4.
+
 The transaction runs at Postgres's default `READ COMMITTED`. Correctness doesn't depend on a stricter level, because the constraints catch what the isolation level lets through.
 
 ## 6. Tech choices
@@ -178,7 +176,7 @@ The transaction runs at Postgres's default `READ COMMITTED`. Correctness doesn't
 - Considered: MySQL, which has no exclusion constraints. There are three ways to hold the overlap invariant there:
   - Row locks: `SELECT … FOR UPDATE` on the bay, technician and vehicle rows, check overlap, then insert. Correct but procedural: any code path that skips the lock breaks the invariant. This is exactly what D8 rejected.
   - Slot table: materialise 15-minute slots, `UNIQUE (resource_id, slot_start)`, one row per slot per booking (OIL = 2 rows). An overlap becomes a duplicate key, so the guard stays declarative like the exclusion constraint. Only possible because D1 fixed the slot grid. Cost: N rows per booking, and availability reads change shape.
-  - Advisory lock per dealership (`GET_LOCK`): simplest, but it serialises the whole dealership instead of one resource. Fine at this industry's volume, wasteful under load.
+  - Advisory lock per dealership (`GET_LOCK`): simplest, but it serialises the whole dealership instead of one resource, and without a constraint behind it, it would be the correctness guard, which any code path that skips it breaks. The Postgres design takes the same lock, but only as the liveness guard (§5).
 
   On MySQL I'd pick the slot table. The decision is about keeping the invariant declarative, not about the database.
 - Switch when: the platform standardises on MySQL. The slot table is the migration path, and the domain layer does not change.
@@ -193,10 +191,10 @@ The transaction runs at Postgres's default `READ COMMITTED`. Correctness doesn't
 - Considered: Redis with a TTL. It's faster, but it can't share a transaction with the booking, so a crash between the two writes leaves a booking without its key, or the other way round.
 - Switch when: not while bookings live in Postgres.
 
-**Retry 3 times with 50–100 ms jittered backoff, then 503 with `Retry-After: 1`** (D8).
-- Why: a lost race usually means "pick the next bay", not "no room". Retrying avoids false 409s (decisions.md §6 #6). The random wait spreads out requests that lost the same race, so they don't collide again on the next candidate. Worst case it adds about 200 ms to a request.
-- Considered: 409 on the first violation (wrong answer when another bay was free); serialising bookings per dealership with an advisory lock.
-- Switch when: the metrics show 503s for a busy dealership. Then I'd take a per-dealership advisory lock at the start of the transaction, so its bookings queue instead of racing. **Unsure** if that ever happens at realistic volume.
+**Per-dealership lock + one defensive re-run, then 503 with `Retry-After: 1`** (D8).
+- Why: the lock makes a dealership's bookings queue instead of race, so a check is never stale and no booking is turned away while another bay was free. Without it, inserts that clash on a constraint deadlock in chains under contention (`ceb8c6d`). The one re-run, after a 50–100 ms jittered backoff, covers the race the lock can't: the same vehicle at two dealerships. Worst case it adds about 100 ms to a request.
+- Considered: constraints alone with up to 3 retries, the original design (deadlocked under contention); 409 on the first violation (wrong answer when another bay was free).
+- Switch when: one dealership saturates its lock, i.e. bookings there queue long enough to show in `booking_latency_seconds`. Then lock per resource (each candidate bay and technician, in id order) instead of per dealership.
 
 **slog + two metrics, no tracing SDK** (D13).
 - Why: one log line per decision is enough to explain any rejected booking; two metrics cover "failing" and "slow".
@@ -234,14 +232,14 @@ The transaction runs at Postgres's default `READ COMMITTED`. Correctness doesn't
 
 **Log convention** (D13). Structured JSON via `slog`. Every line has `request_id`, `method`, `path`, plus `dealership_id` once known. Logs only at boundaries:
 - request in, request out (status, duration);
-- each domain decision with its reason (e.g. `result=conflict reason=no_technician`, `result=retry attempt=2`);
+- each domain decision with its reason (e.g. `result=conflict reason=no_technician`, `result=retry` before the re-run);
 - each DB error.
 
 No logging inside loops or helpers. The test for the convention: any rejected booking can be explained from its lines alone.
 
 **Metrics.**
 - `booking_attempts_total{result}`: one count per `POST /appointments`, `result` one of `created`, `replayed`, `conflict`, `invalid`, `unavailable`, `error` (D13). The 409 reason stays in logs, not in a label.
-- `booking_latency_seconds`: histogram of the whole request, retries included.
+- `booking_latency_seconds`: histogram of the whole request, time waiting on the dealership lock and the re-run included.
 
 **What I'd alert on.**
 - `error` + `unavailable` as a share of all attempts, above a threshold for 5 minutes. Bookings are failing for reasons that aren't the customer's.
@@ -258,11 +256,11 @@ Rough sizing for 1000 dealerships, ~10 bays each, ~15 jobs per bay per day: abou
 
 **What breaks first, in my expected order:**
 
-1. **Availability reads.** Clients call `GET /availability` far more than they book, often once per date they show. If availability runs one query per candidate start time, that's ~35 queries per call. Change: load the dealership's bays, technicians and that day's appointments in one or two queries, compute the free starts in memory. Same rule, same function the booking uses.
+1. **Availability reads.** Clients call `GET /availability` far more than they book, often once per date they show. One query per candidate start time would be ~35 queries per call. Built, not future: availability loads the dealership's bays, technicians and that day's appointments once and computes the free starts in memory, with the same function the booking uses (`PickResources`).
 2. **Database connections.** Several instances × a pool each runs into Postgres's connection limit before CPU. Change: small pools, plus a pooler (PgBouncer or RDS Proxy) in transaction mode. That works here because nothing relies on session state.
 3. **`idempotency_keys` growth.** Without cleanup, expiry would be lazy (an old row is overwritten only when the same key comes back) and most rows would stay forever. Already planned (D9): a periodic `DELETE … WHERE created_at < now() - interval '24 hours'`, run as a scheduled task outside the service (ECS scheduled task or cron; locally a make target). Not a loop in each instance: N instances would run it N times. At this volume that is ~150k rows a day, a small delete. If it ever isn't, batch the delete or partition the table by day and drop old partitions.
 4. **`appointments` grows forever.** Fine for years at this volume with an index on `(dealership_id, start)`. Change, much later: partition by month, or move past appointments to an archive table.
-5. **Hot dealership contention.** One very busy dealership at a busy moment could see 503s after 3 lost races. Contention is per dealership, so adding more dealerships doesn't make it worse. Change, if the metric shows it: the per-dealership advisory lock from §6.
+5. **Hot dealership contention.** Each dealership is serialised: its bookings take one lock and run one at a time. That bounds one dealership's booking throughput to one transaction at a time, a few milliseconds each, so hundreds of bookings a second per dealership, far above the under-10-a-second peak for all 1000 together. It does not bound the system: dealerships don't share a lock, so adding dealerships doesn't make it worse. Change, if one dealership's lock wait shows in latency: lock per resource (§6).
 
 I would not add a cache for availability. The point of "real-time" in decisions.md §0.3 is that the answer reflects the database at request time, and the reads above are cheap once batched.
 
