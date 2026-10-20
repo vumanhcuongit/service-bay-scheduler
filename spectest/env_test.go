@@ -56,6 +56,12 @@ type opt func(*request)
 
 func extra(m map[string]any) opt { return func(r *request) { r.extra = m } }
 
+// raw sends body as is, in place of the four fields.
+func raw(body string) opt { return func(r *request) { r.raw = &body } }
+
+// dealership books at id instead of DL1.
+func dealership(id string) opt { return func(r *request) { r.dealership = id } }
+
 // startAt turns "09:00" or "09:00:30" into Day local time; anything longer is used as given.
 func startAt(at string) string {
 	switch len(at) {
@@ -163,6 +169,18 @@ func (e *env) status(r *httptest.ResponseRecorder, code int) {
 	if r.Code != code {
 		e.t.Fatalf("status %d, want %d; body %s", r.Code, code, r.Body.String())
 	}
+}
+
+// message returns the "message" field of an error body.
+func (e *env) message(r *httptest.ResponseRecorder) string {
+	e.t.Helper()
+	var b struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(r.Body.Bytes(), &b); err != nil {
+		e.t.Fatalf("decode error body %q: %v", r.Body.String(), err)
+	}
+	return b.Message
 }
 
 func expect[T comparable](t *testing.T, name string, got, want T) {
