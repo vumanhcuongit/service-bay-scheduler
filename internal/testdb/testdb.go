@@ -37,7 +37,7 @@ func shared(t *testing.T) *pgxpool.Pool {
 			return
 		}
 		db := stdlib.OpenDBFromPool(pool)
-		defer db.Close()
+		defer func() { _ = db.Close() }()
 		var p *goose.Provider
 		p, initErr = goose.NewProvider(goose.DialectPostgres, db, migrations.FS)
 		if initErr != nil {

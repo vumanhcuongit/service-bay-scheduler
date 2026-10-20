@@ -79,7 +79,7 @@ func TestExclusionConstraintsArePartialOnStatus(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer sp.Rollback(ctx)
+			defer func() { _ = sp.Rollback(ctx) }()
 			_, err = sp.Exec(ctx, insert, c.vehicle, c.bay, c.tech, c.start, c.end)
 			var pgErr *pgconn.PgError
 			if !errors.As(err, &pgErr) || pgErr.Code != "23P01" || pgErr.ConstraintName != c.constraint {
