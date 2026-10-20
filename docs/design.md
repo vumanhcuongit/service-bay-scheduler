@@ -1,0 +1,256 @@
+# Design
+
+For a reader evaluating the architecture. Behaviour lives in the [booking spec](superpowers/specs/2026-10-20-booking.md), rules and their reasons in [decisions.md](decisions.md) (D-numbers), API shapes in [openapi.yaml](../openapi.yaml). This file explains how the pieces fit and why; it does not repeat them.
+
+Items marked **Unsure** are not settled in decisions.md. They are my current lean, not a decision.
+
+---
+
+## 1. Problem
+
+A dealership books service work by phone and by hand, so the same bay or technician gets double-booked, or a job lands on someone who can't do it.
+The advisor needs to know, while the customer is still on the line, which times actually work for this service.
+Once a time is confirmed it must hold: a bay and a qualified technician are reserved for the whole job, and nothing else can take them.
+
+## 2. Architecture
+
+```mermaid
+flowchart TB
+    client["Client<br/>(advisor UI, mobile app, cURL)"]
+
+    subgraph svc["Go service (stateless, N instances)"]
+        direction TB
+        subgraph http["HTTP layer"]
+            rid["<b>★ request-id middleware</b><br/>X-Request-ID in/out, puts id in context"]
+            acc["access log + metrics middleware"]
+            h["handlers<br/>decode, 400 checks, map result to status"]
+            rid --> acc --> h
+        end
+        subgraph domain["Domain"]
+            book["booking service<br/>key lookup, 404/422/409 rules,<br/>assignment, retry loop"]
+            avail["availability<br/>same free-slot rule as booking"]
+            clock["clock (injected)"]
+        end
+        subgraph repository["Repository"]
+            repo["SQL, transactions,<br/>constraint errors → typed errors"]
+        end
+        h --> book
+        h --> avail
+        book --> clock
+        avail --> clock
+        book --> repo
+        avail --> repo
+    end
+
+    pg[("Postgres<br/>exclusion constraints,<br/>idempotency_keys")]
+
+    client -->|HTTPS / JSON| rid
+    repo --> pg
+
+    classDef marked fill:#ffd966,stroke:#b45f06,stroke-width:2px
+    class rid marked
+```
+
+The request-id middleware (★, highlighted) is the outermost layer, so every log line below it, including the access log, carries the id.
+
+## 3. Components
+
+**Request-id middleware.** Reads `X-Request-ID` or generates one, puts it in the request context and on the response. It must not know about routes, bookings or the database; it is the spot where tracing would plug in later (§7).
+
+**Access log + metrics middleware.** Writes one log line per request in and out, and records the two booking metrics (§7). It must not know why a booking failed beyond what the handler puts on the context; the reason is logged by the domain.
+
+**Handlers.** Decode JSON, run the 400 checks (missing fields, types, offset on `start`, key format), call the domain, and turn the domain result into a status code and body. They must not know about bays, technicians, hours or SQL. All they know is "domain returned created / conflict(reason) / invalid / not found / unavailable".
+
+**Booking service (domain).** Owns the check order after 400 (key lookup → 404 → 422 → 409), the assignment rule (D7), and the retry loop (D8). It reads time only from the injected clock. It must not know about HTTP status codes, headers or SQL error codes; it sees `ErrBayTaken`, `ErrTechnicianTaken`, `ErrVehicleBusy` from the repository, not SQLSTATE `23P01`.
+
+**Availability (domain).** Answers `GET /availability` with the same "is this bay / technician free for `[start, end)`" rule the booking uses, so the list and the booking cannot disagree (spec rule 12). It must not know about vehicles or idempotency.
+
+**Clock.** One interface, `Now()`. Production uses the wall clock; tests fix it (D12). Nothing else in the code calls `time.Now()`.
+
+**Repository.** Runs SQL, owns transaction start/commit/rollback, and translates constraint violations into the typed errors above by constraint name. It must not know the business rules: it doesn't decide which bay comes first or which 409 reason wins; it only returns rows and errors.
+
+**Postgres.** Holds all state. Its exclusion constraints are the last word on overlaps (§5).
+
+**Replay body.** The idempotency key row stores the domain result (created appointment or conflict reason) as JSON, not an HTTP response. The handler renders it with the same code on the first response and on every replay, so the bodies match and HTTP stays out of the domain.
+
+## 4. Data flow: `POST /appointments`
+
+Happy path, with a key:
+
+1. Request-id middleware sets the id. Access middleware logs the request in and starts the latency timer.
+2. Handler decodes and validates the body. Malformed → **400**, nothing touched in the DB.
+3. Domain opens a transaction and inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9).
+4. No existing row (or one older than 24 h) → continue as new.
+5. Domain loads dealership, vehicle, service type. Unknown → **404**, rollback (key row goes too).
+6. Domain checks the request against the rules: aligned, `start > now`, inside hours, service type belongs to dealership. Fails → **422**, rollback.
+7. Domain checks the vehicle, then bays, then technicians, using the rules in D4–D7. First failure becomes the 409 reason.
+8. Domain picks the first free bay and first free qualified technician by id and inserts the appointment.
+9. Domain writes the result onto the key row and commits. Key row and appointment land together.
+10. Handler returns **201**. Access middleware logs the result and records metrics.
+
+**409 path.** Step 7 finds a blocker (`vehicle_busy`, `no_bay` or `no_technician`). The domain writes the 409 result onto the key row and commits the key row alone. Handler returns **409** with the reason. A retry with the same key replays the same 409.
+
+**Retry-then-503 path.** Two requests pass step 7 for the same bay or technician; one wins the insert at step 8, the other hits an exclusion violation.
+
+1. Postgres aborts the loser's transaction; everything in it, including its key row, is gone.
+2. Repository maps the violation to `ErrBayTaken` or `ErrTechnicianTaken`.
+3. Domain waits a short random 50–100 ms, then starts a new transaction and re-runs from step 3. The fresh check either finds another candidate, or a real 409. The random wait keeps two losers from colliding again on the same next candidate.
+4. After 3 attempts in total, the domain returns "unavailable". Handler returns **503** with `Retry-After: 1`. Nothing is stored, so the client's retry with the same key runs as new.
+
+A vehicle violation at step 8 is different: no other candidate can fix it, so it goes straight to **409** `vehicle_busy` with no retry (D8).
+
+A side effect worth knowing: while A is between attempts, its key row doesn't exist. A same-key request B that was waiting on it runs as new, and A's next attempt then waits on B's key row and replays B's result. The outcome is still one booking per key.
+
+**Idempotent replay path.** Step 3 finds a committed, fresh key row.
+
+- Same `request_hash` → return the stored status and body (201 or 409). No 404/422/409 checks run. That's why a replay still works after `start` has passed (spec M18).
+- Different hash → **422**.
+- Either way, `X-Request-ID` on the response is the current request's, not the original's.
+
+Without a key, steps 3–4 and 9's key write are skipped; the rest is the same.
+
+Any other error (DB timeout, lost connection) → rollback, **500**, nothing stored.
+
+## 5. Data model
+
+Reference data (seeded, D11):
+
+| Table | Key columns |
+|---|---|
+| `dealerships` | `id`, `timezone` (IANA), `open_time`, `close_time` |
+| `skills` | `id` |
+| `bays` | `id`, `dealership_id` |
+| `technicians` | `id`, `dealership_id`, `work_start`, `work_end` |
+| `technician_skills` | `technician_id`, `skill_id` (FK to `skills`) |
+| `service_types` | `id`, `dealership_id`, `duration_minutes`, `required_skill` (FK to `skills`) |
+| `customers` | `id` |
+| `vehicles` | `id`, `customer_id NOT NULL` |
+
+Check constraints keep durations and hours on the 15-minute grid (D1).
+
+Bookings:
+
+| Table | Columns |
+|---|---|
+| `appointments` | `id`, `dealership_id`, `customer_id`, `vehicle_id`, `service_type_id`, `bay_id`, `technician_id`, `start`, `end`, `status` |
+| `idempotency_keys` | `key` (PK), `request_hash`, `status`, `body`, `created_at` |
+
+The three exclusion constraints on `appointments`, each partial `WHERE status = 'confirmed'`:
+
+```sql
+EXCLUDE USING gist (bay_id        WITH =, tstzrange(start, "end") WITH &&)
+EXCLUDE USING gist (technician_id WITH =, tstzrange(start, "end") WITH &&)
+EXCLUDE USING gist (vehicle_id    WITH =, tstzrange(start, "end") WITH &&)
+```
+
+`tstzrange` defaults to `[)`, which is the half-open rule from D6. Equality on a text id inside a gist index needs the `btree_gist` extension. The gist indexes that back these constraints also serve the "who is busy between X and Y" reads.
+
+`idempotency_keys` uses the primary key as the lock: a second insert of the same key waits until the first transaction ends.
+
+**Why the database is the final guard.** The domain check in step 7 runs before the insert, so two requests can both see a free bay and both try to take it. Any check in Go has this gap, and an in-process lock doesn't help once there are two instances. The exclusion constraint closes it: Postgres rejects the second overlapping row no matter which instance or code path wrote it. The domain check is still there, but its job is to produce a clear 409 reason, not to keep the calendar correct. Reasoning and alternatives: D8.
+
+The transaction runs at Postgres's default `READ COMMITTED`. Correctness doesn't depend on a stricter level, because the constraints catch what the isolation level lets through.
+
+## 6. Tech choices
+
+**Go.**
+- Why: one static binary, `net/http` and `log/slog` in the standard library, cheap to run several instances.
+- Considered: I'm familiar with Go, and it is the stack I can defend deepest in review. The parts that matter here (transactions, constraints, concurrency) are language independent, so another language would not change the design.
+- Switch when: the team that owns this is fluent in something else. The design carries over.
+
+**Postgres.**
+- Why: exclusion constraints on ranges. They turn "no overlapping bookings" into a rule the database enforces, which is the core of the problem. Few databases have this.
+- Considered: MySQL, which has no equivalent, so the guard would move to row locks in application code.
+- Switch when: not for this workload. Bookings are a small, relational, write-light dataset.
+
+**Exclusion constraints as the overlap guard.**
+- Why: declarative; no future code path can skip them (D8).
+- Considered: `SELECT … FOR UPDATE` on bay and technician rows; an application mutex (D8).
+- Switch when: a rule a constraint can't express shows up, e.g. "a technician does at most N jobs a day". Then I'd lock the technician row in the transaction, and keep the constraints for overlaps.
+
+**Idempotency keys in the same Postgres database.**
+- Why: the key row and the appointment have to commit or roll back together. That only works if they're in the same transaction.
+- Considered: Redis with a TTL. It's faster, but it can't share a transaction with the booking, so a crash between the two writes leaves a booking without its key, or the other way round.
+- Switch when: not while bookings live in Postgres.
+
+**Retry 3 times with 50–100 ms jittered backoff, then 503 with `Retry-After: 1`** (D8).
+- Why: a lost race usually means "pick the next bay", not "no room". Retrying avoids false 409s (decisions.md §6 #6). The random wait spreads out requests that lost the same race, so they don't collide again on the next candidate. Worst case it adds about 200 ms to a request.
+- Considered: 409 on the first violation (wrong answer when another bay was free); serialising bookings per dealership with an advisory lock.
+- Switch when: the metrics show 503s for a busy dealership. Then I'd take a per-dealership advisory lock at the start of the transaction, so its bookings queue instead of racing. **Unsure** if that ever happens at realistic volume.
+
+**slog + two metrics, no tracing SDK** (D13).
+- Why: one log line per decision is enough to explain any rejected booking; two metrics cover "failing" and "slow".
+- Considered: full OpenTelemetry (D13).
+- Switch when: there is more than one service in the request path, or a tracing backend someone actually reads.
+
+**Router: standard `net/http` mux.**
+- Why: method + path patterns are enough for three routes; no dependency.
+- Considered: `chi`.
+- Switch when: middleware per route group gets messy.
+
+**DB driver: `pgx`.**
+- Why: it exposes the constraint name on errors, which the repository needs to tell bay, technician and vehicle violations apart.
+- Considered: `database/sql` + `lib/pq`.
+- Switch when: not expected.
+
+**Migrations: `goose`, plain SQL files.**
+- Why: the schema is mostly constraints and extensions (`btree_gist`), which are clearest as SQL. `goose` just runs numbered files in order.
+- Considered: `golang-migrate`; an ORM's auto-migration (hides the constraints this design depends on).
+- Switch when: not expected.
+
+**Postgres in tests: Docker Compose.**
+- Why: the (pg) tests need a real Postgres for the exclusion constraints and key locks. One `docker compose up` serves both local runs and CI.
+- Considered: testcontainers (starts a container per test run from Go code).
+- Switch when: CI can't run Compose, or tests need a fresh database per package.
+
+**Metrics: Prometheus text format** on `/metrics`.
+- Why: the de facto format; every metrics backend can scrape it.
+- Considered: pushing to CloudWatch directly.
+- Switch when: moving to OpenTelemetry (§7).
+
+## 7. Observability
+
+**Request id.** Set by the outermost middleware, echoed in `X-Request-ID`, and attached to every log line through the context. A replay carries the current request's id, so a retried call can be followed on its own (D9).
+
+**Log convention** (D13). Structured JSON via `slog`. Every line has `request_id`, `method`, `path`, plus `dealership_id` once known. Logs only at boundaries:
+- request in, request out (status, duration);
+- each domain decision with its reason (e.g. `result=conflict reason=no_technician`, `result=retry attempt=2`);
+- each DB error.
+
+No logging inside loops or helpers. The test for the convention: any rejected booking can be explained from its lines alone.
+
+**Metrics.**
+- `booking_attempts_total{result}`: one count per `POST /appointments`, `result` one of `created`, `replayed`, `conflict`, `invalid`, `unavailable`, `error` (D13). The 409 reason stays in logs, not in a label.
+- `booking_latency_seconds`: histogram of the whole request, retries included.
+
+**What I'd alert on.**
+- `error` + `unavailable` as a share of all attempts, above a threshold for 5 minutes. Bookings are failing for reasons that aren't the customer's.
+- p95 `booking_latency_seconds` above a threshold for 5 minutes. Usually the database.
+- No `created` at all for 30 minutes during opening hours, when there were attempts. Catches the quiet failures, e.g. a clock bug that makes everything 422.
+
+I don't have thresholds yet; they need a baseline from real traffic. 409s are not an alert: a full workshop is a business fact, not an outage. It belongs on a dashboard.
+
+**Later, OpenTelemetry:** the request-id middleware becomes the span-starting middleware, the request id becomes (or links to) the trace id, and the two metrics move to OTel instruments with the same names.
+
+## 8. Scale & reliability
+
+Rough sizing for 1000 dealerships, ~10 bays each, ~15 jobs per bay per day: about 150k bookings a day, under 10 writes a second at peak. Writes are not the problem. Each overlap check touches one dealership's day, and the constraints only conflict within one bay, technician or vehicle. These numbers are estimates, not measurements.
+
+**What breaks first, in my expected order:**
+
+1. **Availability reads.** Clients call `GET /availability` far more than they book, often once per date they show. If availability runs one query per candidate start time, that's ~35 queries per call. Change: load the dealership's bays, technicians and that day's appointments in one or two queries, compute the free starts in memory. Same rule, same function the booking uses.
+2. **Database connections.** Several instances × a pool each runs into Postgres's connection limit before CPU. Change: small pools, plus a pooler (PgBouncer or RDS Proxy) in transaction mode. That works here because nothing relies on session state.
+3. **`idempotency_keys` growth.** Without cleanup, expiry would be lazy (an old row is overwritten only when the same key comes back) and most rows would stay forever. Already planned (D9): a periodic `DELETE … WHERE created_at < now() - interval '24 hours'`, run as a scheduled task outside the service (ECS scheduled task or cron; locally a make target). Not a loop in each instance: N instances would run it N times. At this volume that is ~150k rows a day, a small delete. If it ever isn't, batch the delete or partition the table by day and drop old partitions.
+4. **`appointments` grows forever.** Fine for years at this volume with an index on `(dealership_id, start)`. Change, much later: partition by month, or move past appointments to an archive table.
+5. **Hot dealership contention.** One very busy dealership at a busy moment could see 503s after 3 lost races. Contention is per dealership, so adding more dealerships doesn't make it worse. Change, if the metric shows it: the per-dealership advisory lock from §6.
+
+I would not add a cache for availability. The point of "real-time" in decisions.md §0.3 is that the answer reflects the database at request time, and the reads above are cheap once batched.
+
+**AWS deployment.** The service runs as a container on ECS Fargate, two or more tasks across availability zones, behind an Application Load Balancer that health-checks a `/healthz` endpoint. Postgres is RDS for PostgreSQL, Multi-AZ, with `btree_gist` enabled. RDS supports it, so the exclusion constraints carry over unchanged. DB credentials come from Secrets Manager. Migrations run as a one-off ECS task before the new version takes traffic; the `idempotency_keys` cleanup runs as an ECS scheduled task. Graceful shutdown (D12) should finish in-flight requests within the ALB's deregistration delay. Logs go to CloudWatch Logs as JSON. Metrics are scraped from `/metrics` into Amazon Managed Prometheus. Because the service holds no state, scaling is just changing the task count; the limit is the database, which is what items 1–2 above address.
+
+## 9. Out of scope
+
+See [decisions.md §3](decisions.md#3-out-of-scope-deliberate).
+
+## 10. How GenAI was used in design
+
