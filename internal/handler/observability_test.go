@@ -167,7 +167,12 @@ func gather(t *testing.T, reg *prometheus.Registry, name string) []map[string]an
 
 func TestLogLinesCarryRequestContext(t *testing.T) {
 	e := newObsEnv(t)
-	e.post(oilAt9, nil)
+	var booked struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(e.post(oilAt9, nil).Body.Bytes(), &booked); err != nil {
+		t.Fatal(err)
+	}
 	e.logs.Reset()
 
 	if rec := e.post(oilAt9, map[string]string{"X-Request-ID": "R9"}); rec.Code != http.StatusConflict {
@@ -195,6 +200,25 @@ func TestLogLinesCarryRequestContext(t *testing.T) {
 	}
 	if decision["dealership_id"] != "DL1" || decision["reason"] != "vehicle_busy" {
 		t.Errorf("decision line %v, want dealership_id DL1, reason vehicle_busy", decision)
+	}
+
+	// A read learns the dealership from the appointment it looked up (decisions §5 #16).
+	e.logs.Reset()
+	if rec := e.get("/appointments/" + booked.ID); rec.Code != http.StatusOK {
+		t.Fatalf("GET status %d, want 200", rec.Code)
+	}
+	var out map[string]any
+	for _, l := range strings.Split(strings.TrimSpace(e.logs.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("log line %q: %v", l, err)
+		}
+		if m["msg"] == "request out" {
+			out = m
+		}
+	}
+	if out["dealership_id"] != "DL1" {
+		t.Errorf("GET request out line %v, want dealership_id DL1", out)
 	}
 }
 

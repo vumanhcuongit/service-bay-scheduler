@@ -96,6 +96,7 @@ func (h *handler) handleGetAppointment(w http.ResponseWriter, r *http.Request) {
 		h.writeServiceError(w, r, err)
 		return
 	}
+	infoFrom(r.Context()).DealershipID = a.DealershipID
 	writeJSON(w, http.StatusOK, toAppointmentJSON(a))
 }
 
