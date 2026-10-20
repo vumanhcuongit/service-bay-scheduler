@@ -2,11 +2,8 @@ package repository_test
 
 import (
 	"context"
-	"errors"
 	"testing"
-	"time"
 
-	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/repository"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/testdb"
 )
@@ -27,65 +24,21 @@ func TestInTxReleasesConnectionOnPanic(t *testing.T) {
 	}
 }
 
-// A mapping test, not a reproduction: two inserts per transaction force a 40P01 on demand,
-// which no booking does. The deadlock it stands for is the one LockDealership leaves, the same
-// vehicle at two dealerships. Postgres aborts one, and it must reach the service as
-// model.ErrDeadlock, which gets the re-run, not as a 500. It runs through InTx, so it also
-// proves the insert's lock_timeout leaves the deadlock detector time to pick one victim.
-func TestInsertAppointmentMapsDeadlock(t *testing.T) {
-	r := repository.New(testdb.Pool(t))
-	ctx := context.Background()
-	at := func(dealership, serviceType, vehicle, bay, tech string, hour int) model.Appointment {
-		start := time.Date(2026, 10, 21, hour, 0, 0, 0, time.UTC)
-		return model.Appointment{
-			DealershipID: dealership, CustomerID: "C1", VehicleID: vehicle, ServiceTypeID: serviceType,
-			BayID: bay, TechnicianID: tech, Start: start, End: start.Add(30 * time.Minute),
-			Status: model.StatusConfirmed,
-		}
-	}
-	errs := make(chan error, 2)
-	run := func(first, second model.Appointment, mine, theirs chan struct{}) {
-		errs <- r.InTx(ctx, func(ctx context.Context) error {
-			if _, err := r.InsertAppointment(ctx, first); err != nil {
-				return err
-			}
-			close(mine)
-			<-theirs
-			_, err := r.InsertAppointment(ctx, second) // waits on the other's first row
-			return err
-		})
-	}
-	a, b := make(chan struct{}), make(chan struct{})
-	go run(at("DL1", "OIL", "V1", "B1", "T1", 2), at("DL1", "OIL", "V2", "B2", "T2", 3), a, b)
-	go run(at("DL2", "TIRE", "V2", "B3", "T4", 3), at("DL2", "TIRE", "V1", "B3", "T4", 2), b, a)
-
-	var deadlocked, ok int
-	for range 2 {
-		switch err := <-errs; {
-		case err == nil:
-			ok++
-		case errors.Is(err, model.ErrDeadlock):
-			deadlocked++
-		default:
-			t.Errorf("err = %v, want nil or model.ErrDeadlock", err)
-		}
-	}
-	if ok != 1 || deadlocked != 1 {
-		t.Errorf("%d committed, %d deadlocked; want 1 and 1", ok, deadlocked)
-	}
-}
-
-// Outside a transaction the advisory lock would be released as soon as it was taken, so the
+// Outside a transaction an advisory lock would be released as soon as it was taken, so the
 // call must fail rather than silently not lock.
-func TestLockDealershipNeedsTransaction(t *testing.T) {
+func TestLocksNeedTransaction(t *testing.T) {
 	r := repository.New(testdb.Pool(t))
-	if err := r.LockDealership(context.Background(), "DL1"); err == nil {
-		t.Fatal("LockDealership outside InTx returned nil, want an error")
+	locks := map[string]func(context.Context) error{
+		"LockDealership": func(ctx context.Context) error { return r.LockDealership(ctx, "DL1") },
+		"LockVehicle":    func(ctx context.Context) error { return r.LockVehicle(ctx, "V1") },
 	}
-	if err := r.InTx(context.Background(), func(ctx context.Context) error {
-		return r.LockDealership(ctx, "DL1")
-	}); err != nil {
-		t.Fatalf("LockDealership inside InTx: %v", err)
+	for name, lock := range locks {
+		if err := lock(context.Background()); err == nil {
+			t.Errorf("%s outside InTx returned nil, want an error", name)
+		}
+		if err := r.InTx(context.Background(), lock); err != nil {
+			t.Errorf("%s inside InTx: %v", name, err)
+		}
 	}
 }
 

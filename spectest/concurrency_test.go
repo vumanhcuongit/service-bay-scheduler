@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -144,18 +145,50 @@ func TestRerunOutcome(t *testing.T) {
 	}
 }
 
+// deadlockCounter counts the inserts a booking makes and the ones Postgres aborts as deadlocks.
+// A booking re-runs after a deadlock, so the status codes alone cannot tell a run that
+// deadlocked and recovered from one that never did.
+type deadlockCounter struct {
+	service.Repository
+	inserts, deadlocks atomic.Int32
+}
+
+func (c *deadlockCounter) wrap(r service.Repository) service.Repository {
+	c.Repository = r
+	return c
+}
+
+func (c *deadlockCounter) InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error) {
+	c.inserts.Add(1)
+	a, err := c.Repository.InsertAppointment(ctx, a)
+	if errors.Is(err, model.ErrDeadlock) {
+		c.deadlocks.Add(1)
+	}
+	return a, err
+}
+
 // The same vehicle at two dealerships at once: each holds only its own dealership's lock, so
-// this is the race the lock cannot cover. The vehicle constraint and the re-run make it a 409.
+// the vehicle lock is what serialises them. The loser reads the winner's committed row and gets
+// the 409 from its check, never from the vehicle constraint, and Postgres never has to break a
+// deadlock between them. The re-run would hide one, so the deadlocks are counted in the
+// repository. Each round is a new race; make races repeats the test.
 func TestVehicleAtTwoDealerships(t *testing.T) {
-	e := newPoolEnv(t)
-	rs := together(
-		func() *httptest.ResponseRecorder { return e.book("V1", "OIL", "09:00") },
-		func() *httptest.ResponseRecorder { return e.book("V1", "TIRE", "09:00", dl2()) },
-	)
-	won, lost := winnerFirst(rs)
-	e.status(won, http.StatusCreated)
-	e.conflict(lost, "vehicle_busy")
-	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 1)
+	c := &deadlockCounter{}
+	e := newPoolEnvWith(t, c.wrap)
+	const rounds = 5
+	for i := range rounds {
+		at := fmt.Sprintf("%02d:00", 9+i)
+		rs := together(
+			func() *httptest.ResponseRecorder { return e.book("V1", "OIL", at) },
+			func() *httptest.ResponseRecorder { return e.book("V1", "TIRE", at, dl2()) },
+		)
+		won, lost := winnerFirst(rs)
+		e.status(won, http.StatusCreated)
+		e.conflict(lost, "vehicle_busy")
+	}
+	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), rounds)
+	expect(t, "deadlocks (40P01)", c.deadlocks.Load(), 0)
+	expect(t, "inserts", c.inserts.Load(), rounds)
 }
 
 // holdInOtherSession runs hold in a transaction on its own pool connection, as a concurrent

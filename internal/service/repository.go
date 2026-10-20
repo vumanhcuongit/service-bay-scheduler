@@ -35,9 +35,12 @@ type Repository interface {
 	// transaction ends. ctx must carry a transaction (InTx); without one it returns an error.
 	// A wait past the lock timeout is model.ErrLockTimeout.
 	LockDealership(ctx context.Context, dealershipID string) error
+	// LockVehicle serialises the vehicle's bookings across dealerships until the transaction
+	// ends. It is taken after LockDealership; ctx and the timeout are as for LockDealership.
+	LockVehicle(ctx context.Context, vehicleID string) error
 	// InsertAppointment returns the appointment with its ID, or model.ErrBayTaken,
 	// model.ErrTechnicianTaken or model.ErrVehicleBusy when an exclusion constraint rejects it,
-	// or model.ErrDeadlock when Postgres aborts it to break a deadlock with another insert,
+	// or model.ErrDeadlock when Postgres aborts it to break a deadlock with another insert (the locks leave none),
 	// or model.ErrLockTimeout when it waited on another booking's row past the lock timeout.
 	InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error)
 }

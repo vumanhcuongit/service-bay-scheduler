@@ -16,8 +16,8 @@ import (
 // SQLSTATEs mapped to model errors.
 const (
 	exclusionViolation = "23P01"
-	// deadlockDetected: two inserts whose exclusion checks each wait on the other's
-	// uncommitted row. LockDealership leaves only the same vehicle at two dealerships.
+	// deadlockDetected: two inserts whose exclusion checks each wait on the other's uncommitted
+	// row. The dealership and vehicle locks leave no such pair, so this is a defence, not a path.
 	deadlockDetected = "40P01"
 	// lockNotAvailable: a lock wait ran past lockTimeout (repository.go).
 	lockNotAvailable = "55P03"
@@ -37,15 +37,28 @@ var constraintErrors = map[string]error{
 // A wait past lock_timeout (set by InTx) is model.ErrLockTimeout. Outside a transaction the
 // lock would be released at once, so that is an error.
 func (r *Repository) LockDealership(ctx context.Context, dealershipID string) error {
+	return r.advisoryLock(ctx, "dealership", dealershipID)
+}
+
+// LockVehicle takes the vehicle's advisory lock until the transaction ends, after the
+// dealership lock. One vehicle booked at two dealerships holds a different dealership lock in
+// each, so only this lock serialises them; without it their inserts wait on each other's
+// uncommitted vehicle row and deadlock (D8). Errors as LockDealership does.
+func (r *Repository) LockVehicle(ctx context.Context, vehicleID string) error {
+	return r.advisoryLock(ctx, "vehicle", vehicleID)
+}
+
+// advisoryLock locks the name kind/id; the prefix keeps a dealership and a vehicle with the same id apart.
+func (r *Repository) advisoryLock(ctx context.Context, kind, id string) error {
 	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
 	if !ok {
-		return errors.New("lock dealership: no transaction in context")
+		return fmt.Errorf("lock %s: no transaction in context", kind)
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('dealership/' || $1, 0))`, dealershipID); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, kind+"/"+id); err != nil {
 		if isCode(err, lockNotAvailable) {
 			return model.ErrLockTimeout
 		}
-		return fmt.Errorf("lock dealership: %w", err)
+		return fmt.Errorf("lock %s: %w", kind, err)
 	}
 	return nil
 }
@@ -56,13 +69,8 @@ func isCode(err error, code string) bool {
 }
 
 // InsertAppointment maps an exclusion violation or deadlock to the error the service sees.
-// The constraints stay the guard; LockDealership only keeps them from racing (D8). Its row wait
-// is the one that can deadlock (the same vehicle at two dealerships), so it first raises
-// lock_timeout above deadlock_timeout, letting the detector abort one side, not both.
+// The constraints stay the guard; the dealership and vehicle locks only keep them from racing (D8).
 func (r *Repository) InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error) {
-	if _, err := r.q(ctx).Exec(ctx, `SET LOCAL lock_timeout = '`+insertLockTimeout+`'`); err != nil {
-		return model.Appointment{}, fmt.Errorf("set insert lock_timeout: %w", err)
-	}
 	err := r.q(ctx).QueryRow(ctx, `
 		INSERT INTO appointments
 			(dealership_id, customer_id, vehicle_id, service_type_id, bay_id, technician_id, start, "end", status)
