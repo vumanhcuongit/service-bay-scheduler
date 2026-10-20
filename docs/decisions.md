@@ -103,7 +103,7 @@ From the "backend" option:
 - **Considered:** load balancing, preferred technician — deferred; assignment is one function and can be swapped.
 
 ### D8 — Concurrency & correctness
-- **What:** booking runs in one DB transaction. The application checks availability first (to produce a clear 409 reason), then inserts. Postgres **exclusion constraints** on `(bay_id, tstzrange(start, end))`, `(technician_id, tstzrange(start, end))` and `(vehicle_id, tstzrange(start, end))`, partial `WHERE status = 'confirmed'`, are the final guard. On a bay or technician constraint violation the booking retries in a new transaction, re-running the full check, max 3 attempts; after 3 lost races → 503 with `Retry-After`, nothing stored, the caller retries with the same key. A vehicle constraint violation → 409 `vehicle_busy` immediately, no retry (another candidate cannot fix it).
+- **What:** booking runs in one DB transaction. The application checks availability first (to produce a clear 409 reason), then inserts. Postgres **exclusion constraints** on `(bay_id, tstzrange(start, end))`, `(technician_id, tstzrange(start, end))` and `(vehicle_id, tstzrange(start, end))`, partial `WHERE status = 'confirmed'`, are the final guard. On a bay or technician constraint violation the booking retries in a new transaction, re-running the full check, max 3 attempts, with a jittered backoff of 50–100 ms before each retry; after 3 lost races → 503 with `Retry-After: 1`, nothing stored, the caller retries with the same key. A vehicle constraint violation → 409 `vehicle_busy` immediately, no retry (another candidate cannot fix it).
 - **Why:** check-then-insert is a race; two concurrent requests can both pass the check. The database is the only place that can serialise correctly. The app-level check exists for a good error message, not for correctness.
 - **Considered:** `SELECT ... FOR UPDATE` on resource rows — works, but the exclusion constraint is declarative and cannot be bypassed by a future code path. Application-level mutex — rejected, breaks with more than one instance.
 
@@ -119,7 +119,7 @@ From the "backend" option:
     - `request_hash` = hash of the canonical JSON of the four schema fields (`dealership_id, vehicle_id, service_type_id, start`), `start` normalised to UTC. Unknown fields, key order and whitespace do not count.
     - Same key + same hash → the stored response is replayed, including a 409. Same key + different hash → 422.
     - A concurrent request with the same key blocks on the key row's lock until the first commits or rolls back. Commit → it replays or gets 422 (this also covers same key + different payload at the same moment). Rollback (500, timeout, 503) → the key row is gone and the waiting request runs as new.
-    - A key row older than 24 h is treated as absent and overwritten.
+    - A key row older than 24 h is treated as absent and overwritten. A periodic job deletes rows older than 24 h, so the table does not grow without bound. It runs as a scheduled task outside the service (ECS scheduled task or cron; locally a make target), not as a loop in each instance, which would run it once per instance.
     - `X-Request-ID` on any response, including a replay, is the current request's.
 - **Why:** availability is what a real client needs before it can offer the user a time. 409 reasons are machine-readable so a UI can react. Idempotency makes retries safe (mobile clients, timeouts).
 - **Considered:** returning alternative slots in the 409 body — stretch goal, not required.
@@ -139,7 +139,7 @@ From the "backend" option:
 - **Why:** so more than one instance can run behind a load balancer without coordination.
 
 ### D13 — Observability
-- **What:** request-id middleware (`X-Request-ID` in / out), structured logs (slog) with `request_id, method, path, dealership_id` (when known), logs at boundaries only (request in/out, each domain decision with its reason, each DB error). Two metrics: `booking_attempts_total{result}` and `booking_latency_seconds`. No tracing SDK; the middleware sits where OpenTelemetry would.
+- **What:** request-id middleware (`X-Request-ID` in / out), structured logs (slog) with `request_id, method, path, dealership_id` (when known), logs at boundaries only (request in/out, each domain decision with its reason, each DB error). Two metrics: `booking_attempts_total{result}`, `result` one of `created`, `replayed`, `conflict`, `invalid`, `unavailable`, `error`; and `booking_latency_seconds`. No tracing SDK; the middleware sits where OpenTelemetry would.
 - **Why:** every rejected booking must be explainable from one log line. Two metrics are enough to alert on "bookings failing" and "bookings slow".
 - **Considered:** full OpenTelemetry — rejected for this scope; adds setup with no reader on the other end.
 
