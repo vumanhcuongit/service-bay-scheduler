@@ -1,0 +1,329 @@
+openapi: 3.1.0
+info:
+  title: Service Bay Scheduler
+  version: 0.1.0
+  description: |
+    Books service appointments at car dealerships. The caller chooses a time;
+    the system assigns a bay and a qualified technician.
+    Behaviour: docs/superpowers/specs/2026-10-20-booking.md. Decisions: docs/decisions.md.
+
+servers:
+  - url: http://localhost:8080
+
+# Authentication is out of scope (docs/decisions.md §3).
+security: []
+
+paths:
+  /appointments:
+    post:
+      summary: Book an appointment
+      description: |
+        Checks, in order: 400 malformed → idempotency key lookup → 404 unknown reference →
+        422 invalid request → 409 state conflict.
+        Bay and technician are picked from `dealership_id` only.
+        Unknown body fields are ignored, including `bay_id` and `technician_id`.
+      operationId: createAppointment
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAppointmentRequest'
+            example:
+              dealership_id: DL1
+              vehicle_id: V1
+              service_type_id: OIL
+              start: '2026-10-21T09:00:00+07:00'
+      responses:
+        '201':
+          description: Booked. A replay with the same `Idempotency-Key` returns the same body.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Appointment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The current calendar blocks the booking. Reasons are checked in this order and
+            the first failure is returned: `vehicle_busy`, `no_bay`, `no_technician`.
+            A replay with the same `Idempotency-Key` returns the same body.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conflict'
+              example:
+                reason: no_technician
+                message: no qualified technician free for 09:00–10:00
+        '422':
+          description: |
+            The request is invalid: `start` not aligned to 15 minutes, not after now,
+            outside opening hours; service type not in `dealership_id`; or
+            `Idempotency-Key` reused with a different payload.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                message: appointment would end at 17:15, after closing at 17:00
+        '503':
+          description: |
+            Lost the race for a bay or technician 3 times. Nothing was stored.
+            Retry with the same `Idempotency-Key`.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /appointments/{id}:
+    get:
+      summary: Get an appointment
+      operationId: getAppointment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The appointment.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Appointment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /availability:
+    get:
+      summary: List bookable start times for a service type on a local date
+      description: |
+        A start time is listed if a bay and a qualified technician of the dealership are free
+        for the whole duration, inside opening hours and the technician's hours, and after now.
+        The vehicle is not considered. A past date returns an empty list.
+      operationId: getAvailability
+      parameters:
+        - name: dealership_id
+          in: query
+          required: true
+          schema:
+            type: string
+          example: DL1
+        - name: service_type_id
+          in: query
+          required: true
+          schema:
+            type: string
+          example: OIL
+        - name: date
+          in: query
+          required: true
+          description: Local date in the dealership's timezone.
+          schema:
+            type: string
+            format: date
+          example: '2026-10-21'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Bookable start times, ascending.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Availability'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: Service type does not belong to `dealership_id`.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-generated UUID, global. Payload = the four body fields, `start` normalised
+        to UTC; unknown fields, key order and whitespace do not count.
+        Same key + same payload replays the stored response (201 or 409).
+        Same key + different payload → 422. 400/404/422 store nothing.
+        A key older than 24 h is treated as new.
+      schema:
+        type: string
+        format: uuid
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: Echoed in the response; generated if absent. A replay carries the current request's id, not the original's.
+      schema:
+        type: string
+
+  headers:
+    RequestId:
+      description: The request id, from the request or generated.
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: Malformed request (missing field, wrong type or format, empty or null id, `start` without offset, `Idempotency-Key` not a UUID).
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: A well-formed reference does not exist. On POST, the message names the first unknown, in the order dealership, vehicle, service type.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    CreateAppointmentRequest:
+      type: object
+      required: [dealership_id, vehicle_id, service_type_id, start]
+      properties:
+        dealership_id:
+          type: string
+          minLength: 1
+        vehicle_id:
+          type: string
+          minLength: 1
+        service_type_id:
+          type: string
+          minLength: 1
+        start:
+          type: string
+          format: date-time
+          description: RFC 3339 with offset. Aligned to 15 minutes; seconds and fractions must be zero.
+
+    Appointment:
+      type: object
+      required:
+        [id, dealership_id, customer_id, vehicle_id, service_type_id, bay_id, technician_id, start, end, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        dealership_id:
+          type: string
+        customer_id:
+          type: string
+          description: Copied from the vehicle's owner at booking time.
+        vehicle_id:
+          type: string
+        service_type_id:
+          type: string
+        bay_id:
+          type: string
+        technician_id:
+          type: string
+        start:
+          type: string
+          format: date-time
+          description: UTC.
+        end:
+          type: string
+          format: date-time
+          description: UTC. `start` + service type duration at booking time.
+        status:
+          type: string
+          enum: [confirmed]
+      example:
+        id: 3f1c2a9e-8b7d-4c1e-9a2f-5d6e7f8a9b0c
+        dealership_id: DL1
+        customer_id: C1
+        vehicle_id: V1
+        service_type_id: OIL
+        bay_id: B1
+        technician_id: T1
+        start: '2026-10-21T02:00:00Z'
+        end: '2026-10-21T02:30:00Z'
+        status: confirmed
+
+    Availability:
+      type: object
+      required: [dealership_id, service_type_id, date, start_times]
+      properties:
+        dealership_id:
+          type: string
+        service_type_id:
+          type: string
+        date:
+          type: string
+          format: date
+        start_times:
+          type: array
+          items:
+            type: string
+            format: date-time
+      example:
+        dealership_id: DL1
+        service_type_id: OIL
+        date: '2026-10-21'
+        start_times: ['2026-10-21T01:00:00Z', '2026-10-21T01:15:00Z']
+
+    Conflict:
+      type: object
+      required: [reason, message]
+      properties:
+        reason:
+          type: string
+          enum: [no_bay, no_technician, vehicle_busy]
+        message:
+          type: string
+
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
