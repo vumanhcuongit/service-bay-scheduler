@@ -37,9 +37,10 @@ $(GOLANGCI_LINT):
 test:
 	go test -p 1 ./...
 
-# The pool tests race real commits; 20 runs in a row, so a pass is not luck.
+# All of spectest, 20 runs in a row: the pool tests race real commits, so a pass is not luck.
+# No -run pattern, so a new pool test cannot be left out of it.
 races:
-	go test ./spectest/ -run 'TestM17|TestM25|TestN3[67]|TestTenRacers|TestVehicleAtTwoDealerships' -count=20
+	go test ./spectest/ -count=20
 
 ci: vet layers lint test races
 
