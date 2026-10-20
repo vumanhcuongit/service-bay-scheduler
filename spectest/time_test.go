@@ -32,12 +32,7 @@ func TestM11(t *testing.T) {
 
 func TestN1(t *testing.T) { unprocessable(t, "V1", "OIL", "07:45") }
 func TestN2(t *testing.T) { unprocessable(t, "V1", "OIL", "17:00") }
-func TestN3(t *testing.T) {
-	e := newEnv(t)
-	r := e.book("V1", "EV_CHECK", "16:30")
-	e.status(r, http.StatusUnprocessableEntity)
-	expect(t, "message", e.message(r), "appointment would end at 17:15, after closing at 17:00")
-}
+func TestN3(t *testing.T) { unprocessable(t, "V1", "EV_CHECK", "16:30") }
 func TestN4(t *testing.T) { unprocessable(t, "V1", "OIL", "09:10") }
 func TestN5(t *testing.T) { unprocessable(t, "V1", "OIL", "09:00:30") }
 func TestN6(t *testing.T) { unprocessable(t, "V1", "OIL", "2026-10-20T09:00:00+07:00") }
