@@ -27,10 +27,10 @@ func TestInTxReleasesConnectionOnPanic(t *testing.T) {
 	}
 }
 
-// Inserts at one dealership queue on its lock, so the one deadlock left is the same vehicle
-// booked at two dealerships at once: each insert waits on the other's uncommitted row.
-// Postgres aborts one, and it must reach the service as model.ErrDeadlock (a lost race),
-// not as a 500.
+// A mapping test, not a reproduction: two inserts per transaction force a 40P01 on demand,
+// which no booking does. The deadlock it stands for is the one LockDealership leaves, the same
+// vehicle at two dealerships. Postgres aborts one, and it must reach the service as
+// model.ErrDeadlock, which gets the re-run, not as a 500.
 func TestInsertAppointmentMapsDeadlock(t *testing.T) {
 	r := repository.New(testdb.Pool(t))
 	ctx := context.Background()

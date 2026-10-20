@@ -9,7 +9,7 @@ import (
 
 // Repository is the storage the service needs. The verb prefix states the contract:
 // Get returns one row or model.ErrNotFound, List returns many (empty is not an error),
-// Has returns a bool, and Claim/Save/Insert name the write.
+// Has returns a bool, and Claim/Save/Lock/Insert name the write.
 type Repository interface {
 	// InTx runs fn in a transaction and commits iff fn returns nil. Repository calls made
 	// with fn's ctx run in that transaction; calls with any other ctx run outside it.
@@ -31,6 +31,8 @@ type Repository interface {
 	// It returns nil when the key is claimed, or the committed row when one is fresh at now.
 	ClaimKey(ctx context.Context, key, hash string, now time.Time) (*model.StoredKey, error)
 	SaveKeyOutcome(ctx context.Context, key string, o model.Outcome) error
+	// LockDealership serialises the dealership's bookings until the transaction ends.
+	LockDealership(ctx context.Context, dealershipID string) error
 	// InsertAppointment returns the appointment with its ID, or model.ErrBayTaken,
 	// model.ErrTechnicianTaken or model.ErrVehicleBusy when an exclusion constraint rejects it,
 	// or model.ErrDeadlock when Postgres aborts it to break a deadlock with another insert.

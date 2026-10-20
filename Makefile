@@ -6,7 +6,7 @@ GOLANGCI_LINT_VERSION = v2.15.0
 # A prebuilt binary, so linting needs no newer Go toolchain than go.mod's. The path carries the version, so a bump reinstalls.
 GOLANGCI_LINT = bin/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
-.PHONY: db-up migrate vet layers lint test races ci run cleanup-keys
+.PHONY: db-up migrate vet layers lint test races ci run docker-build cleanup-keys
 
 db-up:
 	docker compose up -d --wait
@@ -45,6 +45,9 @@ ci: vet layers lint test races
 
 run:
 	DATABASE_URL="$(DATABASE_URL)" go run ./cmd/server
+
+docker-build:
+	docker build -t service-bay-scheduler .
 
 cleanup-keys:
 	docker compose exec -T postgres psql -U scheduler -d scheduler -c "DELETE FROM idempotency_keys WHERE created_at < now() - interval '24 hours'"

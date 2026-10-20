@@ -70,8 +70,8 @@ func TestDecisionLines(t *testing.T) {
 			attrs: logLine{"status": float64(422)}},
 		{name: "retry then created", insertErrs: []error{model.ErrTechnicianTaken}, req: req{body: oilAt9},
 			result: "created", retries: 1},
-		{name: "unavailable", insertErrs: []error{model.ErrBayTaken, model.ErrBayTaken, model.ErrBayTaken},
-			req: req{body: oilAt9}, result: "unavailable", retries: 2},
+		{name: "unavailable", insertErrs: []error{model.ErrBayTaken, model.ErrBayTaken},
+			req: req{body: oilAt9}, result: "unavailable", retries: 1},
 		{name: "error", insertErrs: []error{errors.New("boom")}, req: req{body: oilAt9}, result: "error",
 			attrs: logLine{"error": "boom"}},
 	} {
@@ -134,15 +134,15 @@ func TestDecisionLines(t *testing.T) {
 	}
 }
 
-// The histogram times the whole request, so a 503 after three attempts includes both backoffs.
+// The histogram times the whole request, so a 503 after the re-run includes its backoff.
 func TestLatencyIncludesRetries(t *testing.T) {
-	e := newObsEnvWith(t, []error{model.ErrBayTaken, model.ErrBayTaken, model.ErrBayTaken})
+	e := newObsEnvWith(t, []error{model.ErrBayTaken, model.ErrBayTaken})
 	if rec := e.post(oilAt9, nil); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status %d, want 503", rec.Code)
 	}
 	h := gather(t, e.reg, "booking_latency_seconds")[0]
-	if h["count"] != float64(1) || h["sum"].(float64) < 0.1 {
-		t.Fatalf("latency count %v sum %v, want 1 sample ≥ 0.1 s (two 50 ms backoffs)", h["count"], h["sum"])
+	if h["count"] != float64(1) || h["sum"].(float64) < 0.05 {
+		t.Fatalf("latency count %v sum %v, want 1 sample ≥ 0.05 s (one 50 ms backoff)", h["count"], h["sum"])
 	}
 }
 

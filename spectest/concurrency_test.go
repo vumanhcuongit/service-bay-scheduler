@@ -61,8 +61,8 @@ func TestN37(t *testing.T) {
 	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 1)
 }
 
-// Ten bookings race for the two OIL slots at 09:00: exactly two win, one per bay, and every
-// loser gets a clean 409 or 503, never a 500.
+// Ten bookings race for the two OIL slots at 09:00. The dealership lock runs them one at a
+// time, so exactly two win, one per bay, and every loser's check sees both: 409 no_bay, never 503.
 func TestTenRacersForTwoSlots(t *testing.T) {
 	e := newPoolEnv(t)
 	extraVehicles := []string{"V4", "V5", "V6", "V7", "V8", "V9", "V10"}
@@ -87,12 +87,10 @@ func TestTenRacersForTwoSlots(t *testing.T) {
 	}
 	var won []string
 	for _, r := range together(bookings...) {
-		switch r.Code {
-		case http.StatusCreated:
+		if r.Code == http.StatusCreated {
 			won = append(won, e.assigned(r))
-		case http.StatusConflict, http.StatusServiceUnavailable:
-		default:
-			t.Errorf("status %d, want 201, 409 or 503; body %s", r.Code, r.Body.String())
+		} else {
+			e.conflict(r, "no_bay")
 		}
 	}
 	slices.Sort(won)
@@ -106,7 +104,7 @@ func TestN38(t *testing.T) {
 	r := e.book("V1", "OIL", "09:00", key(K5))
 	e.status(r, http.StatusServiceUnavailable)
 	expect(t, "Retry-After", r.Header().Get("Retry-After"), "1")
-	expect(t, "inserts", f.inserts, 3)
+	expect(t, "inserts", f.inserts, 2)
 	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 0)
 	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
 }
@@ -119,8 +117,8 @@ func TestVehicleViolationTwiceIs409(t *testing.T) {
 	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
 }
 
-// A lost race retries in a fresh transaction that claims the key again, so the 201 is stored
-// once and replays. A deadlock between concurrent inserts is such a lost race.
+// A constraint violation or deadlock re-runs in a fresh transaction that claims the key again,
+// so the 201 is stored once and replays.
 func TestLostRaceRetriesWithKey(t *testing.T) {
 	for _, lost := range []error{model.ErrBayTaken, model.ErrTechnicianTaken, model.ErrDeadlock} {
 		t.Run(lost.Error(), func(t *testing.T) {
@@ -136,8 +134,8 @@ func TestLostRaceRetriesWithKey(t *testing.T) {
 	}
 }
 
-// The usual vehicle violation: the other booking has committed by the time ours hits the
-// constraint, so the immediate re-run's fresh check returns the 409, which is stored and replays.
+// The usual vehicle violation, from the same vehicle at another dealership: the other booking
+// has committed by the re-run, so its fresh check returns the 409, which is stored and replays.
 func TestVehicleViolationRerunStores409(t *testing.T) {
 	f := &flakyRepo{failures: 1, err: model.ErrVehicleBusy}
 	e := newPoolEnvWith(t, f.wrap)

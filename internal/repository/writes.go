@@ -17,7 +17,7 @@ import (
 const (
 	exclusionViolation = "23P01"
 	// deadlockDetected: two inserts whose exclusion checks each wait on the other's
-	// uncommitted row. The dealership lock leaves only the same vehicle at two dealerships.
+	// uncommitted row. LockDealership leaves only the same vehicle at two dealerships.
 	deadlockDetected = "40P01"
 )
 
@@ -28,15 +28,20 @@ var constraintErrors = map[string]error{
 	"appointments_vehicle_excl":    model.ErrVehicleBusy,
 }
 
-// InsertAppointment first takes the dealership's insert lock until the transaction ends.
-// Without it, concurrent inserts on one slot each wait on the other's uncommitted row and
-// deadlock, in chains when there are many; Postgres breaks one cycle per second. With it they
-// queue, and each sees the rows committed before it. Checks still race: the constraints stay
-// the guard, and a loser still gets 23P01 and retries (D8).
-func (r *Repository) InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error) {
-	if _, err := r.q(ctx).Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('appointments/' || $1, 0))`, a.DealershipID); err != nil {
-		return model.Appointment{}, fmt.Errorf("lock dealership inserts: %w", err)
+// LockDealership takes the dealership's advisory lock until the transaction ends, so its
+// bookings run one at a time and each one's checks see the rows committed before it. Without
+// it, concurrent inserts on one slot each wait on the other's uncommitted row and deadlock, in
+// chains when there are many; Postgres breaks one cycle per second (D8).
+func (r *Repository) LockDealership(ctx context.Context, dealershipID string) error {
+	if _, err := r.q(ctx).Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('dealership/' || $1, 0))`, dealershipID); err != nil {
+		return fmt.Errorf("lock dealership: %w", err)
 	}
+	return nil
+}
+
+// InsertAppointment maps an exclusion violation or deadlock to the error the service sees.
+// The constraints stay the guard; LockDealership only keeps them from racing (D8).
+func (r *Repository) InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error) {
 	err := r.q(ctx).QueryRow(ctx, `
 		INSERT INTO appointments
 			(dealership_id, customer_id, vehicle_id, service_type_id, bay_id, technician_id, start, "end", status)

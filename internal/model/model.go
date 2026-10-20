@@ -87,7 +87,7 @@ const (
 	ResultInvalid     Result = "invalid"
 	ResultUnavailable Result = "unavailable"
 	ResultError       Result = "error"
-	// ResultRetry is logged for each lost race; it is not a final result, so not a label.
+	// ResultRetry is logged for the re-run; it is not a final result, so not a label.
 	ResultRetry Result = "retry"
 )
 
@@ -110,12 +110,12 @@ type StoredKey struct {
 
 var (
 	ErrNotFound        = errors.New("not found")
-	ErrUnavailable     = errors.New("lost the race for a bay or technician too many times")
+	ErrUnavailable     = errors.New("hit a constraint violation on the re-run too")
 	ErrBayTaken        = errors.New("bay taken")
 	ErrTechnicianTaken = errors.New("technician taken")
 	ErrVehicleBusy     = errors.New("vehicle busy")
 	// ErrDeadlock is two bookings whose exclusion checks waited on each other; Postgres
-	// aborted this one. Like ErrBayTaken it is a lost race, so the booking retries (D8).
+	// aborted this one. Like a constraint violation it gets the one re-run (D8).
 	ErrDeadlock = errors.New("deadlocked with a concurrent booking")
 )
 
