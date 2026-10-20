@@ -95,7 +95,8 @@ paths:
                 message: appointment would end at 17:15, after closing at 17:00
         '503':
           description: |
-            Hit a constraint violation or deadlock on the one re-run too. Nothing was stored.
+            Lock wait timed out, request deadline passed, or a constraint violation or deadlock
+            on the one re-run too. Nothing was stored.
             Retry with the same `Idempotency-Key`.
           headers:
             X-Request-ID:
