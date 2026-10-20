@@ -20,10 +20,14 @@ func Overlaps(a, b Interval) bool {
 }
 
 // LocalWindow returns [from, to) on day's local date in loc, as offsets from local midnight.
+// Each end is built from wall-clock fields, not midnight plus a duration, which would count
+// elapsed time and be an hour out on the day the clocks change.
 func LocalWindow(loc *time.Location, day time.Time, from, to time.Duration) (time.Time, time.Time) {
 	y, m, d := day.In(loc).Date()
-	midnight := time.Date(y, m, d, 0, 0, 0, 0, loc)
-	return midnight.Add(from), midnight.Add(to)
+	at := func(offset time.Duration) time.Time {
+		return time.Date(y, m, d, int(offset/time.Hour), int(offset%time.Hour/time.Minute), 0, 0, loc)
+	}
+	return at(from), at(to)
 }
 
 // PickResources returns the first free bay and the first free technician by id for [start, end) (D7).
