@@ -51,11 +51,11 @@ func (s *Service) attempt(ctx context.Context, req model.BookingRequest) (model.
 	w := model.Interval{Start: req.Start, End: req.Start.Add(st.Duration)}
 	span := fmt.Sprintf("%s–%s", w.Start.In(d.Location).Format("15:04"), w.End.In(d.Location).Format("15:04"))
 
-	busy, err := s.repo.VehicleHasOverlap(ctx, v.ID, w)
+	vehicleHasOverlap, err := s.repo.VehicleHasOverlap(ctx, v.ID, w)
 	if err != nil {
 		return model.Outcome{}, err
 	}
-	if busy {
+	if vehicleHasOverlap {
 		return conflict(model.ReasonVehicleBusy, fmt.Sprintf("vehicle %s already has an appointment overlapping %s", v.ID, span)), nil
 	}
 
