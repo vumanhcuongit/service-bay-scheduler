@@ -110,7 +110,7 @@ From the "backend" option:
 ### D9 — API
 - **What:**
   - `POST /appointments` → 201 with the appointment; 409 `{reason, message}` when the current state blocks the booking; 422 when outside hours, `start` not aligned to 15 min, `start` not in the future, or the service type does not belong to `dealership_id`; 400 on malformed input (missing field, wrong type or format, empty or null id, `start` without offset, `Idempotency-Key` not a UUID); 404 on well-formed but unknown references, naming the first unknown in the order dealership, vehicle, service type. Unknown body fields are ignored.
-  - Checks run in this order: 400 → idempotency key lookup → 404 → 422 → 409.
+  - Checks run in this order: 415 (a `Content-Type` that is not `application/json`; a missing one is accepted) → 400 → idempotency key lookup → 404 → 422 → 409.
   - 422 rules, checked in this order, first failure wins: `start` aligned to 15 min → `start` in the future → service type belongs to `dealership_id` → inside opening hours (`start >= open`, `end <= close`). Ownership comes before hours because the hours check uses the service type's duration: a service type from another dealership would give an "ends after closing" message based on a duration this dealership does not offer.
   - 409 reasons, checked in this order, first failure wins: `vehicle_busy` (the vehicle has an overlapping appointment), `no_bay`, `no_technician` (no qualified technician free). Bay and technician both busy → `no_bay`.
   - `GET /appointments/{id}`

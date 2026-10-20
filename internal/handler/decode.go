@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"regexp"
 	"time"
@@ -22,6 +23,17 @@ var startLayouts = []string{time.RFC3339Nano, "2006-01-02T15:04Z07:00"}
 var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 func isUUID(s string) bool { return uuidPattern.MatchString(s) }
+
+// jsonContentType reports whether a booking body may be read as JSON: Content-Type is missing,
+// or its media type is application/json; parameters such as charset are ignored.
+func jsonContentType(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		return true
+	}
+	mt, _, err := mime.ParseMediaType(ct)
+	return err == nil && mt == "application/json"
+}
 
 // decodeBookingRequest reads exactly one JSON object with the four schema fields, each a
 // non-empty string; unknown fields are ignored (D9). An error is a 400 naming the field.
