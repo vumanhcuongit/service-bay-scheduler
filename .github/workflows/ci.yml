@@ -38,6 +38,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Layers
+        run: make layers
+
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
