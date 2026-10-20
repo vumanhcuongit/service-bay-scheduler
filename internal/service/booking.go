@@ -34,7 +34,34 @@ const (
 // key is the Idempotency-Key, "" for none; it is claimed before any other check, so a stored
 // outcome replays without them (D9). A 409 is an Outcome, not an error. A lost race for a bay
 // or technician retries with a fresh check, at most maxAttempts in total, then ErrUnavailable (D8).
+// Each booking logs one decision line (D13).
 func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
+	out, err := s.book(ctx, req, key)
+	s.logDecision(ctx, out, err)
+	return out, err
+}
+
+// logDecision logs the booking's result. Rejections (404, 422) and failures are left to the
+// caller, which turns them into a status and logs them once with it.
+func (s *Service) logDecision(ctx context.Context, out model.Outcome, err error) {
+	switch {
+	case err == nil && out.Replayed:
+		args := []any{"result", model.ResultReplayed, "outcome", out.Result()}
+		if out.Conflict != nil {
+			args = append(args, "reason", out.Conflict.Reason)
+		}
+		s.log.InfoContext(ctx, "booking replayed", args...)
+	case err == nil && out.Conflict != nil:
+		s.log.InfoContext(ctx, "booking conflict", "result", model.ResultConflict, "reason", out.Conflict.Reason, "message", out.Conflict.Message)
+	case err == nil:
+		s.log.InfoContext(ctx, "booking created", "result", model.ResultCreated, "appointment_id", out.Appointment.ID,
+			"bay_id", out.Appointment.BayID, "technician_id", out.Appointment.TechnicianID)
+	case errors.Is(err, model.ErrUnavailable):
+		s.log.InfoContext(ctx, "booking unavailable after retries", "result", model.ResultUnavailable, "attempts", maxAttempts)
+	}
+}
+
+func (s *Service) book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
 	vehicleRerun := false
 	for attempt := 1; ; {
 		out, err := s.bookOnce(ctx, req, key)
@@ -50,7 +77,7 @@ func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string
 			if attempt == maxAttempts {
 				return model.Outcome{}, model.ErrUnavailable
 			}
-			s.log.InfoContext(ctx, "lost a race for a bay or technician", "result", "retry", "attempt", attempt)
+			s.log.InfoContext(ctx, "lost a race for a bay or technician", "result", model.ResultRetry, "attempt", attempt)
 			if err := sleep(ctx, minBackoff+rand.N(minBackoff)); err != nil {
 				return model.Outcome{}, err
 			}

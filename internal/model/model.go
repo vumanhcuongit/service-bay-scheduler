@@ -76,6 +76,32 @@ type Outcome struct {
 	Replayed    bool         `json:"-"`
 }
 
+// Result names what happened to a booking, in its decision log line and as the
+// booking_attempts_total label (D13). 400, 404 and 422 are all ResultInvalid.
+type Result string
+
+const (
+	ResultCreated     Result = "created"
+	ResultReplayed    Result = "replayed"
+	ResultConflict    Result = "conflict"
+	ResultInvalid     Result = "invalid"
+	ResultUnavailable Result = "unavailable"
+	ResultError       Result = "error"
+	// ResultRetry is logged for each lost race; it is not a final result, so not a label.
+	ResultRetry Result = "retry"
+)
+
+// Results are the booking_attempts_total labels.
+var Results = []Result{ResultCreated, ResultReplayed, ResultConflict, ResultInvalid, ResultUnavailable, ResultError}
+
+// Result is ResultConflict or ResultCreated, ignoring Replayed.
+func (o Outcome) Result() Result {
+	if o.Conflict != nil {
+		return ResultConflict
+	}
+	return ResultCreated
+}
+
 // StoredKey is a committed idempotency key row.
 type StoredKey struct {
 	Hash    string

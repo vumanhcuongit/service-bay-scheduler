@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/service"
 )
@@ -18,6 +21,8 @@ type Config struct {
 	// Timeout is the deadline for each request, and so for every DB call it makes (D12).
 	// Zero means 5 s.
 	Timeout time.Duration
+	// Registry receives the booking metrics and is served on GET /metrics. Nil means a new one.
+	Registry *prometheus.Registry
 }
 
 const defaultTimeout = 5 * time.Second
@@ -31,23 +36,46 @@ func New(svc *service.Service, log *slog.Logger, cfg Config) http.Handler {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = defaultTimeout
 	}
+	if cfg.Registry == nil {
+		cfg.Registry = prometheus.NewRegistry()
+	}
 	h := &handler{svc: svc, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /appointments", h.handleCreateAppointment)
 	mux.HandleFunc("GET /appointments/{id}", h.handleGetAppointment)
-	return requestID(requestTimeout(cfg.Timeout, mux))
+	mux.HandleFunc("GET /availability", h.handleGetAvailability)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	mux.Handle("GET /metrics", promhttp.HandlerFor(cfg.Registry, promhttp.HandlerOpts{}))
+	metrics := newBookingMetrics(cfg.Registry)
+	return requestID(accessLog(log, metrics.middleware(requestTimeout(cfg.Timeout, mux))))
 }
 
 func (h *handler) handleCreateAppointment(w http.ResponseWriter, r *http.Request) {
+	info := infoFrom(r.Context())
 	req, err := decodeBookingRequest(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		info.Result = model.ResultInvalid
+		h.reject(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	info.DealershipID = req.DealershipID
 	out, err := h.svc.Book(r.Context(), req, r.Header.Get("Idempotency-Key"))
 	if err != nil {
-		h.writeServiceError(w, r, err)
+		switch h.writeServiceError(w, r, err) {
+		case http.StatusNotFound, http.StatusUnprocessableEntity:
+			info.Result = model.ResultInvalid
+		case http.StatusServiceUnavailable:
+			info.Result = model.ResultUnavailable
+		default:
+			info.Result = model.ResultError
+		}
 		return
+	}
+	info.Result = out.Result()
+	if out.Replayed {
+		info.Result = model.ResultReplayed
 	}
 	writeOutcome(w, out)
 }
@@ -55,7 +83,7 @@ func (h *handler) handleCreateAppointment(w http.ResponseWriter, r *http.Request
 func (h *handler) handleGetAppointment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !isUUID(id) {
-		writeError(w, http.StatusBadRequest, "id must be a UUID")
+		h.reject(w, r, http.StatusBadRequest, "id must be a UUID")
 		return
 	}
 	a, err := h.svc.GetAppointment(r.Context(), id)
@@ -64,6 +92,30 @@ func (h *handler) handleGetAppointment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toAppointmentJSON(a))
+}
+
+func (h *handler) handleGetAvailability(w http.ResponseWriter, r *http.Request) {
+	q, err := decodeAvailabilityQuery(r)
+	if err != nil {
+		h.reject(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
+	infoFrom(r.Context()).DealershipID = q.DealershipID
+	starts, err := h.svc.ListAvailability(r.Context(), q.DealershipID, q.ServiceTypeID, q.Date)
+	if err != nil {
+		h.writeServiceError(w, r, err)
+		return
+	}
+	out := availabilityJSON{
+		DealershipID:  q.DealershipID,
+		ServiceTypeID: q.ServiceTypeID,
+		Date:          q.Date.Format(time.DateOnly),
+		StartTimes:    make([]string, len(starts)),
+	}
+	for i, t := range starts {
+		out.StartTimes[i] = t.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // writeOutcome renders a booking result. The first response and every replay go through it,
@@ -76,20 +128,32 @@ func writeOutcome(w http.ResponseWriter, o model.Outcome) {
 	writeJSON(w, http.StatusCreated, toAppointmentJSON(*o.Appointment))
 }
 
-func (h *handler) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
+// reject writes a 4xx and logs it once, with the message the caller gets, so any rejection can
+// be explained from its own lines (design §7). The service does not log rejections.
+func (h *handler) reject(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	h.log.InfoContext(r.Context(), "request rejected", "result", model.ResultInvalid, "status", status, "message", msg)
+	writeError(w, status, msg)
+}
+
+// writeServiceError maps a service error to its status, writes it and returns the status.
+func (h *handler) writeServiceError(w http.ResponseWriter, r *http.Request, err error) int {
 	var notFound *model.NotFoundError
 	var invalid *model.InvalidError
 	switch {
 	case errors.As(err, &notFound):
-		writeError(w, http.StatusNotFound, notFound.Error())
+		h.reject(w, r, http.StatusNotFound, notFound.Error())
+		return http.StatusNotFound
 	case errors.As(err, &invalid):
-		writeError(w, http.StatusUnprocessableEntity, invalid.Error())
+		h.reject(w, r, http.StatusUnprocessableEntity, invalid.Error())
+		return http.StatusUnprocessableEntity
 	case errors.Is(err, model.ErrUnavailable):
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "too many concurrent bookings for this slot, retry with the same Idempotency-Key")
+		return http.StatusServiceUnavailable
 	default:
-		h.log.ErrorContext(r.Context(), "request failed", "error", err)
+		h.log.ErrorContext(r.Context(), "request failed", "result", model.ResultError, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
+		return http.StatusInternalServerError
 	}
 }
 
@@ -119,6 +183,13 @@ func toAppointmentJSON(a model.Appointment) appointmentJSON {
 		End:           a.End.UTC().Format(time.RFC3339),
 		Status:        a.Status,
 	}
+}
+
+type availabilityJSON struct {
+	DealershipID  string   `json:"dealership_id"`
+	ServiceTypeID string   `json:"service_type_id"`
+	Date          string   `json:"date"`
+	StartTimes    []string `json:"start_times"`
 }
 
 type conflictJSON struct {

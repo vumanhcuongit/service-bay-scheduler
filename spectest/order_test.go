@@ -50,3 +50,25 @@ func contains(t *testing.T, msg, word string) {
 		t.Errorf("message %q does not contain %q", msg, word)
 	}
 }
+
+// GET /availability checks 400 → 404 dealership → 404 service type → 422; each case breaks
+// two rules and the message names the one that wins.
+func TestOrderAvailability(t *testing.T) {
+	e := newEnv(t)
+	for _, c := range []struct {
+		name, query string
+		code        int
+		word        string
+	}{
+		{"400 before 404", "dealership_id=DL9&service_type_id=OIL", http.StatusBadRequest, "date"},
+		{"bad date before 404", "dealership_id=DL9&service_type_id=NOPE&date=2026-13-01", http.StatusBadRequest, "date"},
+		{"dealership before service type", "dealership_id=DL9&service_type_id=NOPE&date=" + day, http.StatusNotFound, "dealership DL9"},
+		{"404 dealership before 422", "dealership_id=DL9&service_type_id=TIRE&date=" + day, http.StatusNotFound, "dealership DL9"},
+		{"404 service type before 422", "dealership_id=DL2&service_type_id=NOPE&date=" + day, http.StatusNotFound, "service type NOPE"},
+	} {
+		r := e.get("/availability?" + c.query)
+		if r.Code != c.code || !strings.Contains(e.message(r), c.word) {
+			t.Errorf("%s: status %d, want %d naming %q; body %s", c.name, r.Code, c.code, c.word, r.Body.String())
+		}
+	}
+}

@@ -12,6 +12,8 @@ import (
 	"time"
 	_ "time/tzdata" // dealership timezones resolve even on images without tzdata
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/clock"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/handler"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/repository"
@@ -19,7 +21,7 @@ import (
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := slog.New(handler.NewContextHandler(slog.NewJSONHandler(os.Stdout, nil)))
 	if err := run(log); err != nil {
 		log.Error("server stopped", "error", err)
 		os.Exit(1)
@@ -46,7 +48,7 @@ func run(log *slog.Logger) error {
 	defer pool.Close()
 
 	svc := service.New(repository.New(pool), clock.System{}, log)
-	srv := &http.Server{Addr: addr, Handler: handler.New(svc, log, handler.Config{}), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: handler.New(svc, log, handler.Config{Registry: prometheus.NewRegistry()}), ReadHeaderTimeout: 5 * time.Second}
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()

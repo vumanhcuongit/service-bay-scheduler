@@ -88,3 +88,35 @@ func parseStart(s string) (time.Time, error) {
 	}
 	return time.Time{}, errors.New("start must be RFC 3339 with an offset")
 }
+
+type availabilityQuery struct {
+	DealershipID, ServiceTypeID string
+	// Date carries only the year, month and day; the service reads it in the dealership's location.
+	Date time.Time
+}
+
+// decodeAvailabilityQuery reads the three required query parameters. An error is a 400 naming one.
+func decodeAvailabilityQuery(r *http.Request) (availabilityQuery, error) {
+	v := r.URL.Query()
+	var q availabilityQuery
+	for _, f := range []struct {
+		name string
+		dst  *string
+	}{
+		{"dealership_id", &q.DealershipID},
+		{"service_type_id", &q.ServiceTypeID},
+	} {
+		if *f.dst = v.Get(f.name); *f.dst == "" {
+			return availabilityQuery{}, fmt.Errorf("%s is required", f.name)
+		}
+	}
+	date := v.Get("date")
+	if date == "" {
+		return availabilityQuery{}, errors.New("date is required")
+	}
+	var err error
+	if q.Date, err = time.Parse(time.DateOnly, date); err != nil {
+		return availabilityQuery{}, errors.New("date must be YYYY-MM-DD")
+	}
+	return q, nil
+}

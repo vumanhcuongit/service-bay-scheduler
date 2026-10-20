@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/clock"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/handler"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
@@ -72,7 +74,7 @@ func newEnvOn(t *testing.T, db repository.DB, wrap func(service.Repository) serv
 		repo = wrap(repo)
 	}
 	svc := service.New(repo, clk, log)
-	return &env{t: t, h: handler.New(svc, log, handler.Config{}), svc: svc, clock: clk, db: db}
+	return &env{t: t, h: handler.New(svc, log, handler.Config{Registry: prometheus.NewRegistry()}), svc: svc, clock: clk, db: db}
 }
 
 // flakyRepo fails the first `failures` InsertAppointment calls with err, then delegates.
