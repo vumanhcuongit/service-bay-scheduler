@@ -51,20 +51,22 @@ The guard is in Postgres, as three exclusion constraints on `appointments`, one 
 EXCLUDE USING gist (bay_id WITH =, tstzrange(start, "end") WITH &&) WHERE (status = 'confirmed')
 ```
 
-Postgres rejects a second confirmed row whose time range overlaps another on the same bay, whichever instance or code path wrote it, so the booking is correct for every code path and every number of instances, and the Go check only exists to say why a booking was refused. The schema is in [docs/design.md](docs/design.md#5-data-model).
+Postgres rejects a second confirmed row whose time range overlaps another on the same bay, whichever instance or code path wrote it, so no code path and no number of instances can store an overlap, and the Go overlap check only exists to say why a booking was refused. Skill, opening hours and dealership membership are checked in Go, not by the database. The schema is in [docs/design.md](docs/design.md#5-data-model).
+
+The constraint keeps the calendar correct; a per-dealership advisory lock, taken right after the idempotency key and before any check, keeps it live. Both are needed. On its own the constraint deadlocks under contention: inserts that clash on it wait on each other's uncommitted rows, in chains, and losers ran past the deadline into 500s (`ceb8c6d`). On its own the lock is a convention a future code path could skip. Together, a dealership's bookings run one at a time, every loser gets a clean 409, and the one race left, the same vehicle at two dealerships, gets one re-run.
 
 ## Where to look first
 
 With ten minutes, read these in order:
 
 1. [migrations/00001_schema.sql](migrations/00001_schema.sql): the three exclusion constraints at the end of the `appointments` table.
-2. [internal/service/booking.go](internal/service/booking.go): the check order (key, 404, 422, 409) and the retry loop after a lost race.
+2. [internal/service/booking.go](internal/service/booking.go): the check order (key, dealership lock, 404, 422, 409) and the one re-run after a constraint violation.
 3. [spectest/concurrency_test.go](spectest/concurrency_test.go): the races, run against a real Postgres with real commits.
 4. [docs/reviews/](docs/reviews/): what the AI found in the decisions and the spec, and what I ruled on each point.
 
 ## How it was built
 
-I wrote [docs/decisions.md](docs/decisions.md) first (`3dc31d7`), along with the seed data and the key examples. From them, the AI wrote the [spec](docs/superpowers/specs/2026-10-20-booking.md), the [plan](docs/superpowers/plans/2026-10-20-backend.md) and the code. A second agent with no context red-teamed the spec twice, once before it was frozen and once against the running server, and a third reviewed every PR. The red-team output is in [docs/reviews/](docs/reviews/), and each fix from a review is a `fix(ai):` commit ending "caught in PR review". I read every diff and ruled on every finding.
+I wrote [docs/decisions.md](docs/decisions.md) first (`3dc31d7`), along with the seed data and the key examples. From them, the AI wrote the [spec](docs/superpowers/specs/2026-10-20-booking.md), the [plan](docs/superpowers/plans/2026-10-20-backend.md) and the code. A second agent with no context red-teamed the spec twice, once before it was frozen and once against the running server, and a third reviewed every PR. The red-team output is in [docs/reviews/](docs/reviews/), and each fix from a review is a `fix(ai):` commit ending "caught in <where>": PR review, final review, red-team or CI. I read every PR diff and ruled on every finding.
 
 The spec has 63 examples, and every one is a test with the same name, `TestM1` to `TestM25` and `TestN1` to `TestN38` in [spectest/](spectest), out of 106 test functions in total. `make layers` enforces the import rule between the layers in CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)). The concurrency tests commit to a real Postgres instead of rolling back ([internal/testdb/testdb.go](internal/testdb/testdb.go)), and one of them fires ten bookings at the same 09:00 slot, where two bays are free, and expects exactly two to win ([spectest/concurrency_test.go](spectest/concurrency_test.go)). `make races` runs them 20 times in a row, in `make ci` and in CI.
 
