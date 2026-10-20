@@ -127,3 +127,15 @@ func TestExpiredKeyRunsAsNew(t *testing.T) {
 	})
 	expect(t, "key row hash", hash, want)
 }
+
+// The hash keeps fractional seconds: a start 0.5 s later is a different payload, so the key is
+// refused. It was formatted to the second, and the 201 replayed.
+func TestKeyReusedWithFractionalStartIs422(t *testing.T) {
+	e := newEnv(t)
+	e.created(e.book("V1", "OIL", "09:00", key(K1)), "B1", "T1")
+	r := e.book("V1", "OIL", startAt("09:00")[:19]+".5+07:00", key(K1))
+	e.status(r, http.StatusUnprocessableEntity)
+	if msg := e.message(r); !strings.Contains(msg, "Idempotency-Key reused") {
+		t.Errorf("message %q, want the key-reuse refusal, not the grid check", msg)
+	}
+}

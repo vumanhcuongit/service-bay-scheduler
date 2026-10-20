@@ -22,3 +22,12 @@ func TestHashRequestDiffersOnField(t *testing.T) {
 		t.Error("different vehicle gave the same hash")
 	}
 }
+
+func TestHashRequestKeepsFractionalSeconds(t *testing.T) {
+	a := BookingRequest{DealershipID: "DL1", VehicleID: "V1", ServiceTypeID: "OIL", Start: at(9, 0)}
+	b := a
+	b.Start = a.Start.Add(500 * time.Millisecond)
+	if HashRequest(a) == HashRequest(b) {
+		t.Error("starts half a second apart gave the same hash")
+	}
+}
