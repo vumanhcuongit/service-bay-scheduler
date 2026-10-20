@@ -1,7 +1,9 @@
 name: ci
 
+# push only on main; PR branches run through pull_request, so each commit runs once.
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
