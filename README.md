@@ -10,9 +10,7 @@ final guard against overlapping bookings.
 
 ## Run
 
-Needs Go 1.24 and Docker. `make lint` (and so `make ci`) runs the pinned golangci-lint v2.15.0,
-which needs Go 1.26: unless it is installed, `go` downloads that toolchain on first run, which
-needs network access (`GOTOOLCHAIN=local` turns the download off and makes the step fail instead).
+Needs Go 1.24 and Docker.
 
 ```sh
 make db-up migrate run   # Postgres 16 in Docker, migrations + seed, server on :8080
