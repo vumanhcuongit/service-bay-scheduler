@@ -156,9 +156,6 @@ func (s *Service) attempt(ctx context.Context, req model.BookingRequest) (model.
 
 	// The lock covers the availability reads and the insert, nothing else: a 404 or 422 never
 	// waits on it. The key was claimed before it, always, so the two locks cannot form a cycle.
-	if err := s.repo.LockDealership(ctx, d.ID); err != nil {
-		return model.Outcome{}, err
-	}
 	vehicleHasOverlap, err := s.repo.VehicleHasOverlap(ctx, v.ID, w)
 	if err != nil {
 		return model.Outcome{}, err
