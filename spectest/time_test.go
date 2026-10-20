@@ -20,6 +20,7 @@ func TestM9(t *testing.T) {
 func TestM10(t *testing.T) {
 	e := newEnv(t)
 	a := e.created(e.book("V1", "OIL", "2026-10-21T02:00Z"), "B1", "T1")
+	expect(t, "customer_id", a.CustomerID, "C1")
 	expect(t, "start", a.Start, "2026-10-21T02:00:00Z")
 	expect(t, "end", a.End, "2026-10-21T02:30:00Z")
 }
