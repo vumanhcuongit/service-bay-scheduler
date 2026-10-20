@@ -26,10 +26,18 @@ type Repository struct {
 
 func New(db DB) *Repository { return &Repository{db: db} }
 
-// Connect opens a pool. It sets no session state, so it works behind a transaction-mode
-// pooler (design §8); DB calls are bounded by the request deadline instead (D12).
+// Connect opens a pool that is safe behind a transaction-mode pooler (design §8): it sets no
+// session state, and it names no prepared statement. pgx's default exec mode prepares a named
+// statement per connection, which another client's transaction on a pooled connection would not
+// find; CacheDescribe caches only the statement's description and executes it unnamed.
+// DB calls are bounded by the request deadline instead of a startup parameter (D12).
 func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
