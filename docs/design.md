@@ -40,7 +40,7 @@ flowchart TB
             rid --> acc --> h
         end
         subgraph domain["Domain"]
-            book["booking service<br/>key lookup, dealership lock,<br/>404/422/409 rules, assignment, one re-run"]
+            book["booking service<br/>key lookup, 404/422 rules,<br/>dealership lock, 409 rules, assignment, one re-run"]
             avail["availability<br/>same free-slot rule as booking"]
             clock["clock (injected)"]
         end
@@ -74,7 +74,7 @@ The request-id middleware (★, highlighted) is the outermost layer, so every lo
 
 **Handlers.** Decode JSON, run the 400 checks (missing fields, types, offset on `start`, key format), call the domain, and turn the domain result into a status code and body. They must not know about bays, technicians, hours or SQL. All they know is "domain returned created / conflict(reason) / invalid / not found / unavailable".
 
-**Booking service (domain).** Owns the check order after 400 (key lookup → dealership lock → 404 → 422 → 409), the assignment rule (D7), and the one defensive re-run (D8). It reads time only from the injected clock. It must not know about HTTP status codes, headers or SQL error codes; it sees `ErrBayTaken`, `ErrTechnicianTaken`, `ErrVehicleBusy` from the repository, not SQLSTATE `23P01`.
+**Booking service (domain).** Owns the check order after 400 (key lookup → 404 → 422 → dealership lock → 409), the assignment rule (D7), and the one defensive re-run (D8). It reads time only from the injected clock. It must not know about HTTP status codes, headers or SQL error codes; it sees `ErrBayTaken`, `ErrTechnicianTaken`, `ErrVehicleBusy` from the repository, not SQLSTATE `23P01`.
 
 **Availability (domain).** Answers `GET /availability` with the same "is this bay / technician free for `[start, end)`" rule the booking uses, so the list and the booking cannot disagree (spec rule 12). It must not know about vehicles or idempotency.
 
@@ -93,10 +93,10 @@ Happy path, with a key:
 1. Request-id middleware sets the id. Access middleware logs the request in and starts the latency timer.
 2. Handler decodes and validates the body. Malformed → **400**, nothing touched in the DB.
 3. Domain opens a transaction and inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9; 1.1 row 6).
-4. No existing row (or one older than 24 h) → continue as new. Domain takes the dealership's advisory lock, held until commit or rollback; from here on, the dealership's bookings run one at a time (§5). The key is always claimed first, so the two locks are always taken in the same order and cannot form a cycle.
+4. No existing row (or one older than 24 h) → continue as new.
 5. Domain loads dealership, vehicle, service type. Unknown → **404**, rollback (key row goes too).
 6. Domain checks the request against the rules: aligned, `start > now`, inside hours, service type belongs to dealership. Fails → **422**, rollback (1.1 row 5).
-7. Domain checks the vehicle, then bays, then technicians, using the rules in D4–D7 (1.1 rows 3–5). First failure becomes the 409 reason.
+7. Domain reads the dealership's bays and qualified technicians, then takes the dealership's advisory lock, with or without a key. It is held until commit or rollback, so from here to the commit the dealership's bookings run one at a time (§5); a 404 or 422 never waits on it. A wait past `lock_timeout` (2 s) → **503** with `Retry-After: 1`, no re-run. Any key was claimed at step 3, so the key lock always comes first and the two cannot form a cycle. Then the domain checks the vehicle, then bays, then technicians, using the rules in D4–D7 (1.1 rows 3–5). First failure becomes the 409 reason.
 8. Domain picks the first free bay and first free qualified technician by id and inserts the appointment.
 9. Domain writes the result onto the key row and commits. Key row and appointment land together (1.1 row 8).
 10. Handler returns **201**. Access middleware logs the result and records metrics.
@@ -118,7 +118,7 @@ A side effect worth knowing: while A waits for its re-run, its key row doesn't e
 - Different hash → **422**.
 - Either way, `X-Request-ID` on the response is the current request's, not the original's.
 
-Without a key, steps 3–4 and 9's key write are skipped; the rest is the same.
+Without a key, the key claim in steps 3–4 and the key write in step 9 are skipped. The dealership lock in step 7 is still taken; the rest is the same.
 
 Any other error (DB timeout, lost connection) → rollback, **500**, nothing stored.
 

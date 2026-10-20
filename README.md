@@ -60,7 +60,7 @@ The constraint keeps the calendar correct; a per-dealership advisory lock, taken
 With ten minutes, read these in order:
 
 1. [migrations/00001_schema.sql](migrations/00001_schema.sql): the three exclusion constraints at the end of the `appointments` table.
-2. [internal/service/booking.go](internal/service/booking.go): the check order (key, dealership lock, 404, 422, 409) and the one re-run after a constraint violation.
+2. [internal/service/booking.go](internal/service/booking.go): the check order (key, 404, 422, dealership lock, 409) and the one re-run after a constraint violation.
 3. [spectest/concurrency_test.go](spectest/concurrency_test.go): the races, run against a real Postgres with real commits.
 4. [docs/reviews/](docs/reviews/): what the AI found in the decisions and the spec, and what I ruled on each point.
 
