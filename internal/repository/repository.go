@@ -54,8 +54,9 @@ func (r *Repository) InTx(ctx context.Context, fn func(ctx context.Context) erro
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
+	// Runs on error and on panic; after a successful Commit it is a no-op.
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	if err := fn(context.WithValue(ctx, txKey{}, tx)); err != nil {
-		_ = tx.Rollback(context.WithoutCancel(ctx))
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
