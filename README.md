@@ -10,7 +10,9 @@ final guard against overlapping bookings.
 
 ## Run
 
-Needs Go 1.24 and Docker.
+Needs Go 1.24 and Docker. `make lint` (and so `make ci`) runs the pinned golangci-lint v2.15.0,
+which needs Go 1.26: unless it is installed, `go` downloads that toolchain on first run, which
+needs network access (`GOTOOLCHAIN=local` turns the download off and makes the step fail instead).
 
 ```sh
 make db-up migrate run   # Postgres 16 in Docker, migrations + seed, server on :8080
@@ -78,4 +80,6 @@ curl -s localhost:8080/metrics | grep booking_attempts_total # by result: create
 ```
 
 Every response carries `X-Request-ID` (sent or generated), and every log line for the request
-carries it as `request_id`.
+carries it as `request_id`. A sent id is kept if it is 1–128 characters of letters, digits, `.`,
+`_` and `-`; anything else is replaced by a generated one. `/healthz` and `/metrics` are not
+access logged.
