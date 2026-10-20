@@ -35,6 +35,7 @@ func New(svc *service.Service, log *slog.Logger, cfg Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /appointments", h.handleCreateAppointment)
 	mux.HandleFunc("GET /appointments/{id}", h.handleGetAppointment)
+	mux.HandleFunc("GET /availability", h.handleGetAvailability)
 	return requestID(requestTimeout(cfg.Timeout, mux))
 }
 
@@ -64,6 +65,29 @@ func (h *handler) handleGetAppointment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toAppointmentJSON(a))
+}
+
+func (h *handler) handleGetAvailability(w http.ResponseWriter, r *http.Request) {
+	q, err := decodeAvailabilityQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	starts, err := h.svc.ListAvailability(r.Context(), q.DealershipID, q.ServiceTypeID, q.Date)
+	if err != nil {
+		h.writeServiceError(w, r, err)
+		return
+	}
+	out := availabilityJSON{
+		DealershipID:  q.DealershipID,
+		ServiceTypeID: q.ServiceTypeID,
+		Date:          q.Date.Format(time.DateOnly),
+		StartTimes:    make([]string, len(starts)),
+	}
+	for i, t := range starts {
+		out.StartTimes[i] = t.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // writeOutcome renders a booking result. The first response and every replay go through it,
@@ -119,6 +143,13 @@ func toAppointmentJSON(a model.Appointment) appointmentJSON {
 		End:           a.End.UTC().Format(time.RFC3339),
 		Status:        a.Status,
 	}
+}
+
+type availabilityJSON struct {
+	DealershipID  string   `json:"dealership_id"`
+	ServiceTypeID string   `json:"service_type_id"`
+	Date          string   `json:"date"`
+	StartTimes    []string `json:"start_times"`
 }
 
 type conflictJSON struct {
