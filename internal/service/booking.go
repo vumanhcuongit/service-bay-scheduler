@@ -34,7 +34,34 @@ const (
 // key is the Idempotency-Key, "" for none; it is claimed before any other check, so a stored
 // outcome replays without them (D9). A 409 is an Outcome, not an error. A lost race for a bay
 // or technician retries with a fresh check, at most maxAttempts in total, then ErrUnavailable (D8).
+// Each booking logs one decision line (D13).
 func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
+	out, err := s.book(ctx, req, key)
+	s.logDecision(ctx, out, err)
+	return out, err
+}
+
+// logDecision logs the booking's result. Other errors are left to the caller, which logs them
+// as failures.
+func (s *Service) logDecision(ctx context.Context, out model.Outcome, err error) {
+	var notFound *model.NotFoundError
+	var invalid *model.InvalidError
+	switch {
+	case err == nil && out.Replayed:
+		s.log.InfoContext(ctx, "booking replayed", "result", "replayed")
+	case err == nil && out.Conflict != nil:
+		s.log.InfoContext(ctx, "booking conflict", "result", "conflict", "reason", out.Conflict.Reason, "message", out.Conflict.Message)
+	case err == nil:
+		s.log.InfoContext(ctx, "booking created", "result", "created", "appointment_id", out.Appointment.ID,
+			"bay_id", out.Appointment.BayID, "technician_id", out.Appointment.TechnicianID)
+	case errors.As(err, &notFound), errors.As(err, &invalid):
+		s.log.InfoContext(ctx, "booking rejected", "result", "invalid", "message", err.Error())
+	case errors.Is(err, model.ErrUnavailable):
+		s.log.InfoContext(ctx, "booking unavailable after retries", "result", "unavailable", "attempts", maxAttempts)
+	}
+}
+
+func (s *Service) book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
 	vehicleRerun := false
 	for attempt := 1; ; {
 		out, err := s.bookOnce(ctx, req, key)
