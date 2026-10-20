@@ -50,9 +50,9 @@ func (r *Repository) LockVehicle(ctx context.Context, vehicleID string) error {
 
 // advisoryLock locks the name kind/id; the prefix keeps a dealership and a vehicle with the same id apart.
 func (r *Repository) advisoryLock(ctx context.Context, kind, id string) error {
-	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
-	if !ok {
-		return fmt.Errorf("lock %s: no transaction in context", kind)
+	tx, err := txFrom(ctx, "lock "+kind)
+	if err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, kind+"/"+id); err != nil {
 		if isCode(err, lockNotAvailable) {
@@ -63,6 +63,18 @@ func (r *Repository) advisoryLock(ctx context.Context, kind, id string) error {
 	return nil
 }
 
+// txFrom returns the transaction InTx put in ctx. Every write needs it: a context from anywhere
+// else would run on the pool outside the transaction, and a lock taken there is released at
+// once. Tests nest every InTx in one rolled-back transaction, so the guard cannot rely on
+// q(ctx) falling back to the pool.
+func txFrom(ctx context.Context, op string) (pgx.Tx, error) {
+	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
+	if !ok {
+		return nil, fmt.Errorf("%s: no transaction in context", op)
+	}
+	return tx, nil
+}
+
 func isCode(err error, code string) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == code
@@ -71,7 +83,11 @@ func isCode(err error, code string) bool {
 // InsertAppointment maps an exclusion violation or deadlock to the error the service sees.
 // The constraints stay the guard; the dealership and vehicle locks only keep them from racing (D8).
 func (r *Repository) InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error) {
-	err := r.q(ctx).QueryRow(ctx, `
+	tx, err := txFrom(ctx, "insert appointment")
+	if err != nil {
+		return model.Appointment{}, err
+	}
+	err = tx.QueryRow(ctx, `
 		INSERT INTO appointments
 			(dealership_id, customer_id, vehicle_id, service_type_id, bay_id, technician_id, start, "end", status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -101,8 +117,11 @@ func (r *Repository) InsertAppointment(ctx context.Context, a model.Appointment)
 // that row over; with a fresh one it returns nothing, but ON CONFLICT DO UPDATE still waits
 // for the holder to commit and then locks the row, so the SELECT reads its committed outcome.
 func (r *Repository) ClaimKey(ctx context.Context, key, hash string, now time.Time) (*model.StoredKey, error) {
-	q := r.q(ctx)
-	err := q.QueryRow(ctx, `
+	tx, err := txFrom(ctx, "claim key")
+	if err != nil {
+		return nil, err
+	}
+	err = tx.QueryRow(ctx, `
 		INSERT INTO idempotency_keys (key, request_hash, created_at) VALUES ($1, $2, $3)
 		ON CONFLICT (key) DO UPDATE
 			SET request_hash = EXCLUDED.request_hash, status = NULL, body = NULL, created_at = EXCLUDED.created_at
@@ -119,7 +138,7 @@ func (r *Repository) ClaimKey(ctx context.Context, key, hash string, now time.Ti
 	}
 	var stored model.StoredKey
 	var body []byte
-	if err := q.QueryRow(ctx, `SELECT request_hash, body FROM idempotency_keys WHERE key = $1`, key).
+	if err := tx.QueryRow(ctx, `SELECT request_hash, body FROM idempotency_keys WHERE key = $1`, key).
 		Scan(&stored.Hash, &body); err != nil {
 		return nil, fmt.Errorf("read key: %w", err)
 	}
@@ -130,6 +149,10 @@ func (r *Repository) ClaimKey(ctx context.Context, key, hash string, now time.Ti
 }
 
 func (r *Repository) SaveKeyOutcome(ctx context.Context, key string, o model.Outcome) error {
+	tx, err := txFrom(ctx, "save key outcome")
+	if err != nil {
+		return err
+	}
 	status := "created"
 	if o.Conflict != nil {
 		status = "conflict"
@@ -138,7 +161,7 @@ func (r *Repository) SaveKeyOutcome(ctx context.Context, key string, o model.Out
 	if err != nil {
 		return fmt.Errorf("encode key outcome: %w", err)
 	}
-	if _, err := r.q(ctx).Exec(ctx, `UPDATE idempotency_keys SET status = $2, body = $3 WHERE key = $1`, key, status, body); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE idempotency_keys SET status = $2, body = $3 WHERE key = $1`, key, status, body); err != nil {
 		return fmt.Errorf("save key outcome: %w", err)
 	}
 	return nil

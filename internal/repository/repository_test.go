@@ -2,8 +2,11 @@ package repository_test
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/repository"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/testdb"
 )
@@ -24,19 +27,38 @@ func TestInTxReleasesConnectionOnPanic(t *testing.T) {
 	}
 }
 
-// Outside a transaction an advisory lock would be released as soon as it was taken, so the
-// call must fail rather than silently not lock.
-func TestLocksNeedTransaction(t *testing.T) {
+// Every write needs the transaction InTx puts in its context. Outside one, a lock would be
+// released as soon as it was taken and a key claim would commit on its own, so each call must
+// fail rather than quietly run on the pool.
+func TestWritesNeedTransaction(t *testing.T) {
 	r := repository.New(testdb.Pool(t))
-	locks := map[string]func(context.Context) error{
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	calls := map[string]func(context.Context) error{
 		"LockDealership": func(ctx context.Context) error { return r.LockDealership(ctx, "DL1") },
 		"LockVehicle":    func(ctx context.Context) error { return r.LockVehicle(ctx, "V1") },
+		"ClaimKey": func(ctx context.Context) error {
+			_, err := r.ClaimKey(ctx, "key", "hash", now)
+			return err
+		},
+		"SaveKeyOutcome": func(ctx context.Context) error {
+			return r.SaveKeyOutcome(ctx, "key", model.Outcome{})
+		},
+		"InsertAppointment": func(ctx context.Context) error {
+			_, err := r.InsertAppointment(ctx, model.Appointment{})
+			return err
+		},
 	}
-	for name, lock := range locks {
-		if err := lock(context.Background()); err == nil {
-			t.Errorf("%s outside InTx returned nil, want an error", name)
-		}
-		if err := r.InTx(context.Background(), lock); err != nil {
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			err := call(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "no transaction in context") {
+				t.Errorf("outside InTx = %v, want a no-transaction error", err)
+			}
+		})
+	}
+	// Inside InTx the same ctx works, here for the two that need no setup.
+	for _, name := range []string{"LockDealership", "LockVehicle"} {
+		if err := r.InTx(context.Background(), calls[name]); err != nil {
 			t.Errorf("%s inside InTx: %v", name, err)
 		}
 	}

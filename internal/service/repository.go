@@ -12,7 +12,8 @@ import (
 // Has returns a bool, and Claim/Save/Lock/Insert name the write.
 type Repository interface {
 	// InTx runs fn in a transaction and commits iff fn returns nil. Repository calls made
-	// with fn's ctx run in that transaction; calls with any other ctx run outside it.
+	// with fn's ctx run in that transaction. With any other ctx a read runs outside it and a
+	// write (the claim, save, lock and insert calls) returns an error.
 	InTx(ctx context.Context, fn func(ctx context.Context) error) error
 
 	GetDealership(ctx context.Context, id string) (model.Dealership, error)
