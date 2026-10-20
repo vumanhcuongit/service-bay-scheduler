@@ -181,7 +181,7 @@ From the "backend" option:
 | # | Point | Verdict | Why |
 |---|---|---|---|
 | 1 | §4 rejects overlapping bookings for one vehicle, but D8 only guards bay and technician | changed: exclusion constraint on `(vehicle_id, range)` | an app-level check alone races, same argument as D8 |
-| 2 | `status` is always `confirmed`, yet §3 relies on constraints considering only `confirmed` | changed: constraints partial `WHERE status='confirmed'`, column kept | cancel later needs no constraint migration |
+| 2 | `status` is always `confirmed`, yet §3 relies on constraints considering only `confirmed` | changed: constraints partial `WHERE status='confirmed'`, column kept | cancel later needs no exclusion-constraint change; widening the status CHECK is one `ALTER` |
 | 3 | 409 for "outside hours" is not a state conflict | changed: 409 only for no bay / no technician; 422 for outside hours, unaligned, cross-dealership; 400 malformed | 409 means current state blocks it; 422 means the request itself is invalid |
 | 4 | "available" uses the resource's working window, but bays have none | changed: bay window = dealership hours | makes §0.3 apply to bays |
 | 5 | relation between technician window and dealership hours undefined | changed: technician effective window = intersection with dealership hours | a technician cannot work while the dealership is closed |
