@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
@@ -22,14 +23,72 @@ func New(r Repository, c model.Clock, l *slog.Logger) *Service {
 	return &Service{repo: r, clock: c, log: l}
 }
 
+// maxAttempts bounds the transactions one booking runs after losing races; before each retry
+// it waits minBackoff plus up to minBackoff more, at random (D8).
+const (
+	maxAttempts = 3
+	minBackoff  = 50 * time.Millisecond
+)
+
 // Book books req, assigning the first free bay and qualified technician (D7).
-// key is the Idempotency-Key, "" for none. A 409 is an Outcome, not an error.
+// key is the Idempotency-Key, "" for none; it is claimed before any other check, so a stored
+// outcome replays without them (D9). A 409 is an Outcome, not an error. A lost race for a bay
+// or technician retries with a fresh check, at most maxAttempts in total, then ErrUnavailable (D8).
 func (s *Service) Book(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
+	vehicleRerun := false
+	for attempt := 1; ; {
+		out, err := s.bookOnce(ctx, req, key)
+		switch {
+		case errors.Is(err, model.ErrVehicleBusy):
+			// The other booking has committed, so a fresh check normally returns the 409 and
+			// stores it on the key. It is not a lost race, so it does not count (D8).
+			if vehicleRerun {
+				return conflict(model.ReasonVehicleBusy, fmt.Sprintf("vehicle %s already has an overlapping appointment", req.VehicleID)), nil
+			}
+			vehicleRerun = true
+		case errors.Is(err, model.ErrBayTaken), errors.Is(err, model.ErrTechnicianTaken), errors.Is(err, model.ErrDeadlock):
+			if attempt == maxAttempts {
+				return model.Outcome{}, model.ErrUnavailable
+			}
+			s.log.InfoContext(ctx, "lost a race for a bay or technician", "result", "retry", "attempt", attempt)
+			if err := sleep(ctx, minBackoff+rand.N(minBackoff)); err != nil {
+				return model.Outcome{}, err
+			}
+			attempt++
+		default:
+			return out, err
+		}
+	}
+}
+
+// bookOnce runs one booking transaction: claim the key, then attempt, then store the outcome.
+func (s *Service) bookOnce(ctx context.Context, req model.BookingRequest, key string) (model.Outcome, error) {
 	var out model.Outcome
 	err := s.repo.InTx(ctx, func(ctx context.Context) error {
+		if key != "" {
+			hash := model.HashRequest(req)
+			stored, err := s.repo.ClaimKey(ctx, key, hash, s.clock.Now())
+			if err != nil {
+				return err
+			}
+			if stored != nil {
+				if stored.Hash != hash {
+					return invalid("Idempotency-Key reused with a different payload")
+				}
+				out = stored.Outcome
+				out.Replayed = true
+				return nil
+			}
+		}
 		var err error
-		out, err = s.attempt(ctx, req)
-		return err
+		if out, err = s.attempt(ctx, req); err != nil {
+			return err
+		}
+		if key != "" {
+			// Same transaction as the appointment, so the key row and the booking commit together.
+			return s.repo.SaveKeyOutcome(ctx, key, out)
+		}
+		return nil
 	})
 	return out, err
 }
@@ -98,6 +157,18 @@ func (s *Service) attempt(ctx context.Context, req model.BookingRequest) (model.
 		return model.Outcome{}, err
 	}
 	return model.Outcome{Appointment: &a}, nil
+}
+
+// sleep waits for d, or returns ctx's error as soon as it is done.
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // GetAppointment returns a booked appointment, or *model.NotFoundError.

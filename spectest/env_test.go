@@ -11,11 +11,13 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/clock"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/handler"
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/repository"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/service"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/testdb"
@@ -31,19 +33,90 @@ var (
 type env struct {
 	t     *testing.T
 	h     http.Handler
+	svc   *service.Service
 	clock *clock.Fixed
 	db    repository.DB
 }
 
 // newEnv runs everything inside one transaction that is rolled back when the test ends.
-// Task 7 adds newEnvWith (wrapped repository) and newPoolEnv (real commits).
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	db := testdb.Tx(t)
+	return newEnvOn(t, testdb.Tx(t), nil)
+}
+
+// newEnvWith is newEnv with the repository wrapped, e.g. by a flakyRepo.
+func newEnvWith(t *testing.T, wrap func(service.Repository) service.Repository) *env {
+	t.Helper()
+	return newEnvOn(t, testdb.Tx(t), wrap)
+}
+
+// newPoolEnv runs on the shared pool, so transactions really commit and race.
+// Bookings and keys are truncated when the test ends.
+func newPoolEnv(t *testing.T) *env {
+	t.Helper()
+	return newEnvOn(t, testdb.Pool(t), nil)
+}
+
+// newPoolEnvWith is newPoolEnv with the repository wrapped.
+func newPoolEnvWith(t *testing.T, wrap func(service.Repository) service.Repository) *env {
+	t.Helper()
+	return newEnvOn(t, testdb.Pool(t), wrap)
+}
+
+func newEnvOn(t *testing.T, db repository.DB, wrap func(service.Repository) service.Repository) *env {
+	t.Helper()
 	clk := clock.NewFixed(defaultNow)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := service.New(repository.New(db), clk, log)
-	return &env{t: t, h: handler.New(svc, log, handler.Config{}), clock: clk, db: db}
+	var repo service.Repository = repository.New(db)
+	if wrap != nil {
+		repo = wrap(repo)
+	}
+	svc := service.New(repo, clk, log)
+	return &env{t: t, h: handler.New(svc, log, handler.Config{}), svc: svc, clock: clk, db: db}
+}
+
+// flakyRepo fails the first `failures` InsertAppointment calls with err, then delegates.
+// onInsert, if set, runs after every call.
+type flakyRepo struct {
+	service.Repository
+	failures int
+	err      error
+	inserts  int
+	onInsert func()
+}
+
+func (f *flakyRepo) wrap(r service.Repository) service.Repository {
+	f.Repository = r
+	return f
+}
+
+func (f *flakyRepo) InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error) {
+	if f.onInsert != nil {
+		defer f.onInsert()
+	}
+	if f.inserts < f.failures {
+		f.inserts++
+		return model.Appointment{}, f.err
+	}
+	return f.Repository.InsertAppointment(ctx, a)
+}
+
+// together runs the bookings at once: each waits on a shared barrier, then all are released.
+func together(bookings ...func() *httptest.ResponseRecorder) []*httptest.ResponseRecorder {
+	out := make([]*httptest.ResponseRecorder, len(bookings))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, b := range bookings {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			out[i] = b()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	return out
 }
 
 type request struct {
@@ -64,6 +137,11 @@ func raw(body string) opt { return func(r *request) { r.raw = &body } }
 func dealership(id string) opt { return func(r *request) { r.dealership = id } }
 
 func dl2() opt { return dealership("DL2") }
+
+// key sends k as the Idempotency-Key; rid sends id as the X-Request-ID.
+func key(k string) opt { return func(r *request) { r.key = k } }
+
+func rid(id string) opt { return func(r *request) { r.rid = id } }
 
 var clockTime = regexp.MustCompile(`^\d\d:\d\d(:\d\d)?$`)
 
@@ -201,6 +279,16 @@ func (e *env) message(r *httptest.ResponseRecorder) string {
 		e.t.Fatalf("decode error body %q: %v", r.Body.String(), err)
 	}
 	return b.Message
+}
+
+// count runs a SELECT count(*) query.
+func (e *env) count(query string, args ...any) int {
+	e.t.Helper()
+	var n int
+	if err := e.db.QueryRow(context.Background(), query, args...).Scan(&n); err != nil {
+		e.t.Fatalf("%s: %v", query, err)
+	}
+	return n
 }
 
 func expect[T comparable](t *testing.T, name string, got, want T) {

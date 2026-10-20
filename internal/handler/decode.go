@@ -25,7 +25,11 @@ func isUUID(s string) bool { return uuidPattern.MatchString(s) }
 
 // decodeBookingRequest reads exactly one JSON object with the four schema fields, each a
 // non-empty string; unknown fields are ignored (D9). An error is a 400 naming the field.
+// An Idempotency-Key that is not a UUID is also a 400, before any lookup (N23).
 func decodeBookingRequest(r *http.Request) (model.BookingRequest, error) {
+	if k := r.Header.Get("Idempotency-Key"); k != "" && !isUUID(k) {
+		return model.BookingRequest{}, errors.New("Idempotency-Key must be a UUID")
+	}
 	var fields map[string]json.RawMessage
 	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxBodyBytes))
 	if err := dec.Decode(&fields); err != nil || fields == nil {

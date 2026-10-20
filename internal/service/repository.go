@@ -32,6 +32,7 @@ type Repository interface {
 	ClaimKey(ctx context.Context, key, hash string, now time.Time) (*model.StoredKey, error)
 	SaveKeyOutcome(ctx context.Context, key string, o model.Outcome) error
 	// InsertAppointment returns the appointment with its ID, or model.ErrBayTaken,
-	// model.ErrTechnicianTaken or model.ErrVehicleBusy when an exclusion constraint rejects it.
+	// model.ErrTechnicianTaken or model.ErrVehicleBusy when an exclusion constraint rejects it,
+	// or model.ErrDeadlock when Postgres aborts it to break a deadlock with another insert.
 	InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error)
 }
