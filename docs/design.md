@@ -12,6 +12,21 @@ A dealership books service work by phone and by hand, so the same bay or technic
 The advisor needs to know, while the customer is still on the line, which times actually work for this service.
 Once a time is confirmed it must hold: a bay and a qualified technician are reserved for the whole job, and nothing else can take them.
 
+### 1.1 What must not happen
+
+A booking system earns trust by never doing a small number of things. This design is organised around those, and the rest of the document is how each one is held. Each row names the failure, the mechanism that prevents it, where to read about it, and the test that proves it. Test names are the spec's example numbers: `N36` is example N36 in the [booking spec](superpowers/specs/2026-10-20-booking.md) and `TestN36` in [spectest/](../spectest/). M is a case that must succeed, N a case that must be rejected.
+
+| Failure | What prevents it | Read | Test |
+|---|---|---|---|
+| Two cars booked into the same bay, or with the same technician, at the same time | Postgres refuses the second overlapping row (exclusion constraints). The check in Go only explains why; it is not what keeps the calendar correct | §5, D8 | [N36](../spectest/concurrency_test.go), [M25](../spectest/concurrency_test.go), run 20× in CI |
+| One car booked in two places at once | a third exclusion constraint, on the vehicle | §5, D8 | [N37](../spectest/concurrency_test.go) |
+| A booking confirmed when only the bay or only the technician was free, or when one of them was free at the start but busy later in the job | both must be free for the whole `[start, end)`; the check runs on the full interval, and the constraints use the full interval too | §4 step 7, D6, D7 | [N9](../spectest/conflict_test.go), [N10](../spectest/conflict_test.go), [N11](../spectest/conflict_test.go) |
+| A job given to someone who cannot do it | technicians are filtered by the service's required skill before any are considered | §4 step 7, D3, D4 | [N14](../spectest/conflict_test.go), [N15](../spectest/conflict_test.go) |
+| A job that runs past closing time, or past the technician's shift | the whole `[start, end)` must fit inside the dealership's hours and the technician's window | §4 steps 6–7, D2, D4 | [N1–N3](../spectest/time_test.go), [N16](../spectest/conflict_test.go) |
+| A customer who retries ends up with two appointments | the idempotency key is claimed inside the same transaction as the booking; a retry replays the first answer | §4, D9 | [M15](../spectest/idempotency_test.go), [M17](../spectest/concurrency_test.go) |
+| A customer turned away while another bay was free | a lost race is retried with a fresh look at the calendar, up to three times | §4, D8 | [M25](../spectest/concurrency_test.go) |
+| A booking saved without its key, or a key saved without its booking | both rows commit or roll back together; nothing is written outside the transaction | §4, §5, D9 | [N38](../spectest/concurrency_test.go) |
+
 ## 2. Architecture
 
 ```mermaid
@@ -79,13 +94,13 @@ Happy path, with a key:
 
 1. Request-id middleware sets the id. Access middleware logs the request in and starts the latency timer.
 2. Handler decodes and validates the body. Malformed → **400**, nothing touched in the DB.
-3. Domain opens a transaction and inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9).
+3. Domain opens a transaction and inserts the key row (`key`, `request_hash`, `created_at`). If another request holds the same key, this waits on its lock (D9; 1.1 row 6).
 4. No existing row (or one older than 24 h) → continue as new.
 5. Domain loads dealership, vehicle, service type. Unknown → **404**, rollback (key row goes too).
-6. Domain checks the request against the rules: aligned, `start > now`, inside hours, service type belongs to dealership. Fails → **422**, rollback.
-7. Domain checks the vehicle, then bays, then technicians, using the rules in D4–D7. First failure becomes the 409 reason.
+6. Domain checks the request against the rules: aligned, `start > now`, inside hours, service type belongs to dealership. Fails → **422**, rollback (1.1 row 5).
+7. Domain checks the vehicle, then bays, then technicians, using the rules in D4–D7 (1.1 rows 3–5). First failure becomes the 409 reason.
 8. Domain picks the first free bay and first free qualified technician by id and inserts the appointment.
-9. Domain writes the result onto the key row and commits. Key row and appointment land together.
+9. Domain writes the result onto the key row and commits. Key row and appointment land together (1.1 row 8).
 10. Handler returns **201**. Access middleware logs the result and records metrics.
 
 **409 path.** Step 7 finds a blocker (`vehicle_busy`, `no_bay` or `no_technician`). The domain writes the 409 result onto the key row and commits the key row alone. Handler returns **409** with the reason. A retry with the same key replays the same 409.
@@ -94,7 +109,7 @@ Happy path, with a key:
 
 1. Postgres aborts the loser's transaction; everything in it, including its key row, is gone.
 2. Repository maps the violation to `ErrBayTaken` or `ErrTechnicianTaken`.
-3. Domain waits a short random 50–100 ms, then starts a new transaction and re-runs from step 3. The fresh check either finds another candidate, or a real 409. The random wait keeps two losers from colliding again on the same next candidate.
+3. Domain waits a short random 50–100 ms, then starts a new transaction and re-runs from step 3. The fresh check either finds another candidate, or a real 409 (1.1 row 7). The random wait keeps two losers from colliding again on the same next candidate.
 4. After 3 attempts in total, the domain returns "unavailable". Handler returns **503** with `Retry-After: 1`. Nothing is stored, so the client's retry with the same key runs as new.
 
 A vehicle violation at step 8 is different: no other candidate can fix it, so it goes straight to **409** `vehicle_busy` with no retry (D8). In code, "straight" is one immediate re-run with no backoff: the violation means the other booking has committed, so the fresh check at step 7 returns `vehicle_busy` and stores it on the key row like any other 409. If that re-run hits the vehicle constraint again, the domain returns **409** `vehicle_busy` without storing it, never 500.
@@ -135,7 +150,7 @@ Bookings:
 | `appointments` | `id`, `dealership_id`, `customer_id`, `vehicle_id`, `service_type_id`, `bay_id`, `technician_id`, `start`, `end`, `status` |
 | `idempotency_keys` | `key` (PK), `request_hash`, `status`, `body`, `created_at` |
 
-The three exclusion constraints on `appointments`, each partial `WHERE status = 'confirmed'`:
+The three exclusion constraints on `appointments`, each partial `WHERE status = 'confirmed'` (1.1 rows 1–3):
 
 ```sql
 EXCLUDE USING gist (bay_id        WITH =, tstzrange(start, "end") WITH &&)
@@ -145,7 +160,7 @@ EXCLUDE USING gist (vehicle_id    WITH =, tstzrange(start, "end") WITH &&)
 
 `tstzrange` defaults to `[)`, which is the half-open rule from D6. Equality on a text id inside a gist index needs the `btree_gist` extension. The gist indexes that back these constraints also serve the "who is busy between X and Y" reads.
 
-`idempotency_keys` uses the primary key as the lock: a second insert of the same key waits until the first transaction ends.
+`idempotency_keys` uses the primary key as the lock: a second insert of the same key waits until the first transaction ends (1.1 row 6).
 
 **Why the database is the final guard.** The domain check in step 7 runs before the insert, so two requests can both see a free bay and both try to take it. Any check in Go has this gap, and an in-process lock doesn't help once there are two instances. The exclusion constraint closes it: Postgres rejects the second overlapping row no matter which instance or code path wrote it. The domain check is still there, but its job is to produce a clear 409 reason, not to keep the calendar correct. Reasoning and alternatives: D8.
 
