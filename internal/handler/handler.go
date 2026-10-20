@@ -153,7 +153,7 @@ func (h *handler) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 		return http.StatusUnprocessableEntity
 	case errors.Is(err, model.ErrUnavailable):
 		w.Header().Set("Retry-After", "1")
-		writeError(w, http.StatusServiceUnavailable, "too many concurrent bookings for this slot, retry with the same Idempotency-Key")
+		writeError(w, http.StatusServiceUnavailable, "too many concurrent bookings, retry with the same Idempotency-Key")
 		return http.StatusServiceUnavailable
 	default:
 		h.log.ErrorContext(r.Context(), "request failed", "result", model.ResultError, "error", err)

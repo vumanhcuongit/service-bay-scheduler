@@ -13,13 +13,19 @@ import (
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 )
 
-// SQLSTATEs InsertAppointment maps to lost races.
+// SQLSTATEs mapped to model errors.
 const (
 	exclusionViolation = "23P01"
 	// deadlockDetected: two inserts whose exclusion checks each wait on the other's
 	// uncommitted row. LockDealership leaves only the same vehicle at two dealerships.
 	deadlockDetected = "40P01"
+	// lockNotAvailable: a lock wait ran past lockTimeout.
+	lockNotAvailable = "55P03"
 )
+
+// lockTimeout bounds every lock wait in a booking transaction, well inside the request
+// deadline, so a queue on a dealership's lock gives a 503 instead of a 500 (D8).
+const lockTimeout = "2s"
 
 // constraintErrors maps each exclusion constraint on appointments to the error the service sees (D8).
 var constraintErrors = map[string]error{
@@ -29,14 +35,32 @@ var constraintErrors = map[string]error{
 }
 
 // LockDealership takes the dealership's advisory lock until the transaction ends, so its
-// bookings run one at a time and each one's checks see the rows committed before it. Without
-// it, concurrent inserts on one slot each wait on the other's uncommitted row and deadlock, in
-// chains when there are many; Postgres breaks one cycle per second (D8).
+// availability reads and insert run one booking at a time and each sees the rows committed
+// before it. Without it, concurrent inserts on one slot each wait on the other's uncommitted
+// row and deadlock, in chains when there are many; Postgres breaks one cycle per second (D8).
+// It first sets lock_timeout for the rest of the transaction; a wait past it is
+// model.ErrLockTimeout. Outside a transaction the lock would be released at once, so that is
+// an error.
 func (r *Repository) LockDealership(ctx context.Context, dealershipID string) error {
-	if _, err := r.q(ctx).Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('dealership/' || $1, 0))`, dealershipID); err != nil {
+	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
+	if !ok {
+		return errors.New("lock dealership: no transaction in context")
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '`+lockTimeout+`'`); err != nil {
+		return fmt.Errorf("set lock_timeout: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('dealership/' || $1, 0))`, dealershipID); err != nil {
+		if isCode(err, lockNotAvailable) {
+			return model.ErrLockTimeout
+		}
 		return fmt.Errorf("lock dealership: %w", err)
 	}
 	return nil
+}
+
+func isCode(err error, code string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == code
 }
 
 // InsertAppointment maps an exclusion violation or deadlock to the error the service sees.
@@ -59,6 +83,8 @@ func (r *Repository) InsertAppointment(ctx context.Context, a model.Appointment)
 				}
 			case deadlockDetected:
 				return model.Appointment{}, model.ErrDeadlock
+			case lockNotAvailable: // waited on another booking's row past lock_timeout
+				return model.Appointment{}, model.ErrLockTimeout
 			}
 		}
 		return model.Appointment{}, fmt.Errorf("insert appointment: %w", err)

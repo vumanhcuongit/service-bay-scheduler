@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/repository"
 )
 
 // make races runs the pool tests 20 times in a row, in make ci and in CI, so a pass is not luck.
@@ -99,7 +100,7 @@ func TestTenRacersForTwoSlots(t *testing.T) {
 }
 
 func TestN38(t *testing.T) {
-	f := &flakyRepo{failures: 1 << 30, err: model.ErrBayTaken}
+	f := &flakyRepo{errs: always(model.ErrBayTaken)}
 	e := newEnvWith(t, f.wrap)
 	r := e.book("V1", "OIL", "09:00", key(K5))
 	e.status(r, http.StatusServiceUnavailable)
@@ -109,8 +110,78 @@ func TestN38(t *testing.T) {
 	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
 }
 
+// The re-run's own result decides: a vehicle violation is the only one that becomes a 409.
+func TestRerunOutcome(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		errs   []error
+		status int
+	}{
+		{"deadlock on re-run", []error{model.ErrBayTaken, model.ErrDeadlock}, http.StatusServiceUnavailable},
+		{"vehicle then bay", []error{model.ErrVehicleBusy, model.ErrBayTaken}, http.StatusServiceUnavailable},
+		{"deadlock then vehicle", []error{model.ErrDeadlock, model.ErrVehicleBusy}, http.StatusConflict},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &flakyRepo{errs: c.errs}
+			e := newEnvWith(t, f.wrap)
+			r := e.book("V1", "OIL", "09:00", key(K5))
+			if c.status == http.StatusConflict {
+				e.conflict(r, "vehicle_busy")
+			} else {
+				e.status(r, c.status)
+				expect(t, "Retry-After", r.Header().Get("Retry-After"), "1")
+			}
+			expect(t, "inserts", f.inserts, 2)
+			expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
+		})
+	}
+}
+
+// The same vehicle at two dealerships at once: each holds only its own dealership's lock, so
+// this is the race the lock cannot cover. The vehicle constraint and the re-run make it a 409.
+func TestVehicleAtTwoDealerships(t *testing.T) {
+	e := newPoolEnv(t)
+	rs := together(
+		func() *httptest.ResponseRecorder { return e.book("V1", "OIL", "09:00") },
+		func() *httptest.ResponseRecorder { return e.book("V1", "TIRE", "09:00", dl2()) },
+	)
+	won, lost := winnerFirst(rs)
+	e.status(won, http.StatusCreated)
+	e.conflict(lost, "vehicle_busy")
+	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 1)
+}
+
+// A booking that waits on the dealership lock past lock_timeout gets a 503, never a 500.
+// The lock is held by another session, as a booking at the same dealership would hold it.
+func TestLockTimeoutIs503(t *testing.T) {
+	e := newPoolEnv(t)
+	r := repository.New(e.db)
+	held, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- r.InTx(context.Background(), func(ctx context.Context) error {
+			if err := r.LockDealership(ctx, "DL1"); err != nil {
+				return err
+			}
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	rec := e.book("V1", "OIL", "09:00", key(K5))
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	e.status(rec, http.StatusServiceUnavailable)
+	expect(t, "Retry-After", rec.Header().Get("Retry-After"), "1")
+	expect(t, "appointments", e.count("SELECT count(*) FROM appointments"), 0)
+	expect(t, "key rows", e.count("SELECT count(*) FROM idempotency_keys WHERE key = $1", K5), 0)
+}
+
 func TestVehicleViolationTwiceIs409(t *testing.T) {
-	f := &flakyRepo{failures: 1 << 30, err: model.ErrVehicleBusy}
+	f := &flakyRepo{errs: always(model.ErrVehicleBusy)}
 	e := newEnvWith(t, f.wrap)
 	e.conflict(e.book("V1", "OIL", "09:00", key(K5)), "vehicle_busy")
 	expect(t, "inserts", f.inserts, 2)
@@ -122,7 +193,7 @@ func TestVehicleViolationTwiceIs409(t *testing.T) {
 func TestLostRaceRetriesWithKey(t *testing.T) {
 	for _, lost := range []error{model.ErrBayTaken, model.ErrTechnicianTaken, model.ErrDeadlock} {
 		t.Run(lost.Error(), func(t *testing.T) {
-			f := &flakyRepo{failures: 1, err: lost}
+			f := &flakyRepo{errs: []error{lost}}
 			e := newEnvWith(t, f.wrap)
 			r1 := e.book("V1", "OIL", "09:00", key(K5))
 			e.created(r1, "B1", "T1")
@@ -134,14 +205,14 @@ func TestLostRaceRetriesWithKey(t *testing.T) {
 	}
 }
 
-// The usual vehicle violation, from the same vehicle at another dealership: the other booking
-// has committed by the re-run, so its fresh check returns the 409, which is stored and replays.
+// The usual vehicle violation: the same vehicle booked at DL2 has committed by the re-run, so
+// its fresh check returns the 409, which is stored and replays.
 func TestVehicleViolationRerunStores409(t *testing.T) {
-	f := &flakyRepo{failures: 1, err: model.ErrVehicleBusy}
+	f := &flakyRepo{errs: []error{model.ErrVehicleBusy}}
 	e := newPoolEnvWith(t, f.wrap)
 	f.onInsert = func() {
 		if f.inserts == 1 {
-			e.given("V1", "OIL", "09:00", "B2", "T2") // commits on its own connection
+			e.given("V1", "TIRE", "09:00", "B3", "T4") // DL2's row, committed on its own connection
 		}
 	}
 	r1 := e.book("V1", "OIL", "09:00", key(K5))
@@ -156,7 +227,7 @@ func TestBackoffStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var cancelledAt time.Time
-	f := &flakyRepo{failures: 1 << 30, err: model.ErrBayTaken}
+	f := &flakyRepo{errs: always(model.ErrBayTaken)}
 	f.onInsert = func() {
 		if f.inserts == 1 {
 			cancelledAt = time.Now()

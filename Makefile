@@ -39,7 +39,7 @@ test:
 
 # The pool tests race real commits; 20 runs in a row, so a pass is not luck.
 races:
-	go test ./spectest/ -run 'TestM17|TestM25|TestN3[67]|TestTenRacers' -count=20
+	go test ./spectest/ -run 'TestM17|TestM25|TestN3[67]|TestTenRacers|TestVehicleAtTwoDealerships' -count=20
 
 ci: vet layers lint test races
 

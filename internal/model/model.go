@@ -109,14 +109,19 @@ type StoredKey struct {
 }
 
 var (
-	ErrNotFound        = errors.New("not found")
-	ErrUnavailable     = errors.New("hit a constraint violation on the re-run too")
+	ErrNotFound = errors.New("not found")
+	// ErrUnavailable is a booking that could not complete under contention: a constraint
+	// violation or deadlock on the re-run too, or a lock wait past the lock timeout (D8).
+	ErrUnavailable     = errors.New("booking unavailable under contention")
 	ErrBayTaken        = errors.New("bay taken")
 	ErrTechnicianTaken = errors.New("technician taken")
 	ErrVehicleBusy     = errors.New("vehicle busy")
 	// ErrDeadlock is two bookings whose exclusion checks waited on each other; Postgres
 	// aborted this one. Like a constraint violation it gets the one re-run (D8).
 	ErrDeadlock = errors.New("deadlocked with a concurrent booking")
+	// ErrLockTimeout is a wait on the dealership lock, or on another booking's row, past the
+	// lock timeout. It is not re-run: the wait already used most of the budget (D8).
+	ErrLockTimeout = errors.New("lock wait timed out")
 )
 
 // NotFoundError names a well-formed reference that does not exist (404).

@@ -31,10 +31,13 @@ type Repository interface {
 	// It returns nil when the key is claimed, or the committed row when one is fresh at now.
 	ClaimKey(ctx context.Context, key, hash string, now time.Time) (*model.StoredKey, error)
 	SaveKeyOutcome(ctx context.Context, key string, o model.Outcome) error
-	// LockDealership serialises the dealership's bookings until the transaction ends.
+	// LockDealership serialises the dealership's availability reads and inserts until the
+	// transaction ends. ctx must carry a transaction (InTx); without one it returns an error.
+	// A wait past the lock timeout is model.ErrLockTimeout.
 	LockDealership(ctx context.Context, dealershipID string) error
 	// InsertAppointment returns the appointment with its ID, or model.ErrBayTaken,
 	// model.ErrTechnicianTaken or model.ErrVehicleBusy when an exclusion constraint rejects it,
-	// or model.ErrDeadlock when Postgres aborts it to break a deadlock with another insert.
+	// or model.ErrDeadlock when Postgres aborts it to break a deadlock with another insert,
+	// or model.ErrLockTimeout when it waited on another booking's row past the lock timeout.
 	InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error)
 }

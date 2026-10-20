@@ -73,3 +73,17 @@ func TestInsertAppointmentMapsDeadlock(t *testing.T) {
 		t.Errorf("%d committed, %d deadlocked; want 1 and 1", ok, deadlocked)
 	}
 }
+
+// Outside a transaction the advisory lock would be released as soon as it was taken, so the
+// call must fail rather than silently not lock.
+func TestLockDealershipNeedsTransaction(t *testing.T) {
+	r := repository.New(testdb.Pool(t))
+	if err := r.LockDealership(context.Background(), "DL1"); err == nil {
+		t.Fatal("LockDealership outside InTx returned nil, want an error")
+	}
+	if err := r.InTx(context.Background(), func(ctx context.Context) error {
+		return r.LockDealership(ctx, "DL1")
+	}); err != nil {
+		t.Fatalf("LockDealership inside InTx: %v", err)
+	}
+}
