@@ -13,17 +13,29 @@ import (
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/service"
 )
 
+// Config holds the handler's settings. The zero value uses the defaults.
+type Config struct {
+	// Timeout is the deadline for each request, and so for every DB call it makes (D12).
+	// Zero means 5 s.
+	Timeout time.Duration
+}
+
+const defaultTimeout = 5 * time.Second
+
 type handler struct {
 	svc *service.Service
 	log *slog.Logger
 }
 
-func New(svc *service.Service, log *slog.Logger) http.Handler {
+func New(svc *service.Service, log *slog.Logger, cfg Config) http.Handler {
+	if cfg.Timeout == 0 {
+		cfg.Timeout = defaultTimeout
+	}
 	h := &handler{svc: svc, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /appointments", h.handleCreateAppointment)
 	mux.HandleFunc("GET /appointments/{id}", h.handleGetAppointment)
-	return requestID(mux)
+	return requestID(requestTimeout(cfg.Timeout, mux))
 }
 
 func (h *handler) handleCreateAppointment(w http.ResponseWriter, r *http.Request) {

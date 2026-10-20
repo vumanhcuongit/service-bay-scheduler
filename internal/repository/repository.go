@@ -26,14 +26,14 @@ type Repository struct {
 
 func New(db DB) *Repository { return &Repository{db: db} }
 
-// Connect opens a pool whose statements time out after 5 s (D12).
+// Connect opens a pool. It sets no session state, so it works behind a transaction-mode
+// pooler (design §8); DB calls are bounded by the request deadline instead (D12).
 func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
-	cfg, err := pgxpool.ParseConfig(url)
+	pool, err := pgxpool.New(ctx, url)
 	if err != nil {
-		return nil, fmt.Errorf("parse database url: %w", err)
+		return nil, fmt.Errorf("connect: %w", err)
 	}
-	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "5000"
-	return pgxpool.NewWithConfig(ctx, cfg)
+	return pool, nil
 }
 
 // txKey carries the current transaction in the context, so the repository need not import

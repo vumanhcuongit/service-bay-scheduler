@@ -47,7 +47,7 @@ func newEnvOn(t *testing.T, db repository.DB, wrap func(service.Repository) serv
 	}
 	clk := clock.NewFixed(defaultNow)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return &env{t: t, h: handler.New(service.New(repo, clk, log), log), clock: clk, db: db}
+	return &env{t: t, h: handler.New(service.New(repo, clk, log), log, handler.Config{}), clock: clk, db: db}
 }
 
 type request struct {

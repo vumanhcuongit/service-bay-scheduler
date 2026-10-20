@@ -46,7 +46,7 @@ func run(log *slog.Logger) error {
 	defer pool.Close()
 
 	svc := service.New(repository.New(pool), clock.System{}, log)
-	srv := &http.Server{Addr: addr, Handler: handler.New(svc, log), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: handler.New(svc, log, handler.Config{}), ReadHeaderTimeout: 5 * time.Second}
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
