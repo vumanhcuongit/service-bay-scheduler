@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 	"log/slog"
+
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 )
 
 // requestInfo is what the request's log lines and metrics share. requestID stores it in the
@@ -12,7 +14,7 @@ type requestInfo struct {
 	ID, Method, Path string
 	DealershipID     string
 	// Result is the booking_attempts_total label, set by handleCreateAppointment.
-	Result string
+	Result model.Result
 }
 
 type requestInfoKey struct{}

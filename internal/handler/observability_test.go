@@ -2,6 +2,7 @@ package handler_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/clock"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/handler"
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/repository"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/service"
 	"github.com/vumanhcuongit/service-bay-scheduler/internal/testdb"
@@ -31,11 +33,22 @@ type obsEnv struct {
 // through the context handler, as main does.
 func newObsEnv(t *testing.T) obsEnv {
 	t.Helper()
+	return newObsEnvWith(t, nil)
+}
+
+// newObsEnvWith is newObsEnv with InsertAppointment failing with insertErrs, in order, before
+// it reaches Postgres.
+func newObsEnvWith(t *testing.T, insertErrs []error) obsEnv {
+	t.Helper()
 	logs := &bytes.Buffer{}
 	log := slog.New(handler.NewContextHandler(slog.NewJSONHandler(logs, nil)))
 	reg := prometheus.NewRegistry()
 	now := time.Date(2026, 10, 20, 5, 0, 0, 0, time.UTC)
-	svc := service.New(repository.New(testdb.Tx(t)), clock.NewFixed(now), log)
+	var repo service.Repository = repository.New(testdb.Tx(t))
+	if insertErrs != nil {
+		repo = &failingInserts{Repository: repo, errs: insertErrs}
+	}
+	svc := service.New(repo, clock.NewFixed(now), log)
 	return obsEnv{h: handler.New(svc, log, handler.Config{Registry: reg}), reg: reg, logs: logs}
 }
 
@@ -53,6 +66,20 @@ func (e obsEnv) get(path string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	e.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 	return rec
+}
+
+type failingInserts struct {
+	service.Repository
+	errs []error
+}
+
+func (f *failingInserts) InsertAppointment(ctx context.Context, a model.Appointment) (model.Appointment, error) {
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		return model.Appointment{}, err
+	}
+	return f.Repository.InsertAppointment(ctx, a)
 }
 
 const oilAt9 = `{"dealership_id":"DL1","vehicle_id":"V1","service_type_id":"OIL","start":"2026-10-21T09:00:00+07:00"}`
@@ -89,7 +116,9 @@ func TestBookingMetrics(t *testing.T) {
 	want := map[string]float64{"created": 1, "replayed": 1, "conflict": 1, "invalid": 3, "unavailable": 0, "error": 0}
 	for _, m := range gather(t, e.reg, "booking_attempts_total") {
 		result := m["result"].(string)
-		if m["value"].(float64) != want[result] {
+		if w, ok := want[result]; !ok {
+			t.Errorf("unexpected result label %q", result)
+		} else if m["value"].(float64) != w {
 			t.Errorf("booking_attempts_total{result=%q} = %v, want %v", result, m["value"], want[result])
 		}
 		delete(want, result)
@@ -106,7 +135,7 @@ func TestBookingMetrics(t *testing.T) {
 }
 
 // gather returns one map per series of name: its labels, plus "value" for a counter or
-// "count" for a histogram.
+// "count" and "sum" for a histogram.
 func gather(t *testing.T, reg *prometheus.Registry, name string) []map[string]any {
 	t.Helper()
 	families, err := reg.Gather()
@@ -128,6 +157,7 @@ func gather(t *testing.T, reg *prometheus.Registry, name string) []map[string]an
 			}
 			if h := m.GetHistogram(); h != nil {
 				s["count"] = float64(h.GetSampleCount())
+				s["sum"] = h.GetSampleSum()
 			}
 			out = append(out, s)
 		}

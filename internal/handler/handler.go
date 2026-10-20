@@ -56,10 +56,8 @@ func (h *handler) handleCreateAppointment(w http.ResponseWriter, r *http.Request
 	info := infoFrom(r.Context())
 	req, err := decodeBookingRequest(r)
 	if err != nil {
-		info.Result = "invalid"
-		// The service never sees a 400, so its decision line is logged here (design §7).
-		h.log.InfoContext(r.Context(), "booking rejected", "result", "invalid", "message", err.Error())
-		writeError(w, http.StatusBadRequest, err.Error())
+		info.Result = model.ResultInvalid
+		h.reject(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 	info.DealershipID = req.DealershipID
@@ -67,21 +65,17 @@ func (h *handler) handleCreateAppointment(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		switch h.writeServiceError(w, r, err) {
 		case http.StatusNotFound, http.StatusUnprocessableEntity:
-			info.Result = "invalid"
+			info.Result = model.ResultInvalid
 		case http.StatusServiceUnavailable:
-			info.Result = "unavailable"
+			info.Result = model.ResultUnavailable
 		default:
-			info.Result = "error"
+			info.Result = model.ResultError
 		}
 		return
 	}
-	switch {
-	case out.Replayed:
-		info.Result = "replayed"
-	case out.Conflict != nil:
-		info.Result = "conflict"
-	default:
-		info.Result = "created"
+	info.Result = out.Result()
+	if out.Replayed {
+		info.Result = model.ResultReplayed
 	}
 	writeOutcome(w, out)
 }
@@ -89,7 +83,7 @@ func (h *handler) handleCreateAppointment(w http.ResponseWriter, r *http.Request
 func (h *handler) handleGetAppointment(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !isUUID(id) {
-		writeError(w, http.StatusBadRequest, "id must be a UUID")
+		h.reject(w, r, http.StatusBadRequest, "id must be a UUID")
 		return
 	}
 	a, err := h.svc.GetAppointment(r.Context(), id)
@@ -103,7 +97,7 @@ func (h *handler) handleGetAppointment(w http.ResponseWriter, r *http.Request) {
 func (h *handler) handleGetAvailability(w http.ResponseWriter, r *http.Request) {
 	q, err := decodeAvailabilityQuery(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		h.reject(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 	infoFrom(r.Context()).DealershipID = q.DealershipID
@@ -134,23 +128,30 @@ func writeOutcome(w http.ResponseWriter, o model.Outcome) {
 	writeJSON(w, http.StatusCreated, toAppointmentJSON(*o.Appointment))
 }
 
+// reject writes a 4xx and logs it once, with the message the caller gets, so any rejection can
+// be explained from its own lines (design §7). The service does not log rejections.
+func (h *handler) reject(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	h.log.InfoContext(r.Context(), "request rejected", "result", model.ResultInvalid, "status", status, "message", msg)
+	writeError(w, status, msg)
+}
+
 // writeServiceError maps a service error to its status, writes it and returns the status.
 func (h *handler) writeServiceError(w http.ResponseWriter, r *http.Request, err error) int {
 	var notFound *model.NotFoundError
 	var invalid *model.InvalidError
 	switch {
 	case errors.As(err, &notFound):
-		writeError(w, http.StatusNotFound, notFound.Error())
+		h.reject(w, r, http.StatusNotFound, notFound.Error())
 		return http.StatusNotFound
 	case errors.As(err, &invalid):
-		writeError(w, http.StatusUnprocessableEntity, invalid.Error())
+		h.reject(w, r, http.StatusUnprocessableEntity, invalid.Error())
 		return http.StatusUnprocessableEntity
 	case errors.Is(err, model.ErrUnavailable):
 		w.Header().Set("Retry-After", "1")
 		writeError(w, http.StatusServiceUnavailable, "too many concurrent bookings for this slot, retry with the same Idempotency-Key")
 		return http.StatusServiceUnavailable
 	default:
-		h.log.ErrorContext(r.Context(), "request failed", "error", err)
+		h.log.ErrorContext(r.Context(), "request failed", "result", model.ResultError, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return http.StatusInternalServerError
 	}

@@ -6,18 +6,25 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/vumanhcuongit/service-bay-scheduler/internal/model"
 )
 
-// requestID is the outermost middleware: it takes X-Request-ID or generates one, echoes it on
-// the response and puts a *requestInfo carrying it in the context. It knows nothing about
-// routes or bookings.
+// requestIDPattern bounds a caller's X-Request-ID, which goes into every log line of the request.
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
+// requestID is the outermost middleware: it takes X-Request-ID, or generates one when it is
+// absent or not 1–128 characters of letters, digits, '.', '_' and '-'. It echoes the id on the
+// response and puts a *requestInfo carrying it in the context. It knows nothing about routes
+// or bookings.
 func requestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-ID")
-		if id == "" {
+		if !requestIDPattern.MatchString(id) {
 			id = newRequestID()
 		}
 		w.Header().Set("X-Request-ID", id)
@@ -27,8 +34,13 @@ func requestID(next http.Handler) http.Handler {
 }
 
 // accessLog logs each request on the way in and on the way out, with its status and duration.
+// Health checks and metric scrapes are polled constantly, so they are not logged.
 func accessLog(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		start := time.Now()
 		log.InfoContext(r.Context(), "request in")
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -46,9 +58,6 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
 }
-
-// bookingResults are the booking_attempts_total labels (D13). 400, 404 and 422 are all invalid.
-var bookingResults = []string{"created", "replayed", "conflict", "invalid", "unavailable", "error"}
 
 type bookingMetrics struct {
 	attempts *prometheus.CounterVec
@@ -68,8 +77,8 @@ func newBookingMetrics(reg prometheus.Registerer) bookingMetrics {
 		}),
 	}
 	reg.MustRegister(m.attempts, m.latency)
-	for _, r := range bookingResults {
-		m.attempts.WithLabelValues(r) // export every result from the start, at 0
+	for _, r := range model.Results {
+		m.attempts.WithLabelValues(string(r)) // export every result from the start, at 0
 	}
 	return m
 }
@@ -84,11 +93,11 @@ func (m bookingMetrics) middleware(next http.Handler) http.Handler {
 		}
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		result := "error"
+		result := model.ResultError
 		if info := infoFrom(r.Context()); info != nil && info.Result != "" {
 			result = info.Result
 		}
-		m.attempts.WithLabelValues(result).Inc()
+		m.attempts.WithLabelValues(string(result)).Inc()
 		m.latency.Observe(time.Since(start).Seconds())
 	})
 }

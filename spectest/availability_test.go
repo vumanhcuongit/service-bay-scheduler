@@ -1,6 +1,7 @@
 package spectest
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"slices"
@@ -105,18 +106,19 @@ func TestAvailabilityBadParams(t *testing.T) {
 	for _, c := range []struct {
 		name, query string
 		code        int
+		word        string // the message names the failing parameter
 	}{
-		{"no date", "dealership_id=DL1&service_type_id=OIL", http.StatusBadRequest},
-		{"bad date", "dealership_id=DL1&service_type_id=OIL&date=2026-13-01", http.StatusBadRequest},
-		{"no dealership", "service_type_id=OIL&date=" + day, http.StatusBadRequest},
-		{"no service type", "dealership_id=DL1&date=" + day, http.StatusBadRequest},
-		{"unknown dealership", "dealership_id=DL9&service_type_id=OIL&date=" + day, http.StatusNotFound},
-		{"unknown service type", "dealership_id=DL1&service_type_id=NOPE&date=" + day, http.StatusNotFound},
-		{"service type of another dealership", "dealership_id=DL1&service_type_id=TIRE&date=" + day, http.StatusUnprocessableEntity},
+		{"no date", "dealership_id=DL1&service_type_id=OIL", http.StatusBadRequest, "date"},
+		{"bad date", "dealership_id=DL1&service_type_id=OIL&date=2026-13-01", http.StatusBadRequest, "date"},
+		{"no dealership", "service_type_id=OIL&date=" + day, http.StatusBadRequest, "dealership_id"},
+		{"no service type", "dealership_id=DL1&date=" + day, http.StatusBadRequest, "service_type_id"},
+		{"unknown dealership", "dealership_id=DL9&service_type_id=OIL&date=" + day, http.StatusNotFound, "dealership DL9"},
+		{"unknown service type", "dealership_id=DL1&service_type_id=NOPE&date=" + day, http.StatusNotFound, "service type NOPE"},
+		{"service type of another dealership", "dealership_id=DL1&service_type_id=TIRE&date=" + day, http.StatusUnprocessableEntity, "not offered"},
 	} {
 		r := e.get("/availability?" + c.query)
-		if r.Code != c.code || e.message(r) == "" {
-			t.Errorf("%s: status %d, want %d with a message; body %s", c.name, r.Code, c.code, r.Body.String())
+		if r.Code != c.code || !strings.Contains(e.message(r), c.word) {
+			t.Errorf("%s: status %d, want %d naming %q; body %s", c.name, r.Code, c.code, c.word, r.Body.String())
 		}
 	}
 }
@@ -132,4 +134,29 @@ func TestAvailabilityStartsAfterNow(t *testing.T) {
 	}
 	e.status(e.book("V1", "OIL", "2026-10-20T12:00:00+07:00"), http.StatusUnprocessableEntity)
 	e.created(e.book("V1", "OIL", "2026-10-20T12:15:00+07:00"), "B1", "T1")
+}
+
+// date is a local date in the dealership's timezone, not UTC. The seed only has +07:00, where
+// UTC midnight falls on the same local date, so this adds a dealership at UTC−4 on Day.
+func TestAvailabilityDateIsDealershipLocal(t *testing.T) {
+	e := newEnv(t)
+	if _, err := e.db.Exec(context.Background(), `
+		INSERT INTO dealerships (id, timezone, open_time, close_time) VALUES ('DLNY', 'America/New_York', '08:00', '17:00');
+		INSERT INTO bays (id, dealership_id) VALUES ('BNY', 'DLNY');
+		INSERT INTO technicians (id, dealership_id, work_start, work_end) VALUES ('TNY', 'DLNY', '08:00', '17:00');
+		INSERT INTO technician_skills (technician_id, skill_id) VALUES ('TNY', 'oil');
+		INSERT INTO service_types (id, dealership_id, duration_minutes, required_skill) VALUES ('OIL_NY', 'DLNY', 30, 'oil');`); err != nil {
+		t.Fatal(err)
+	}
+	r := e.get("/availability?dealership_id=DLNY&service_type_id=OIL_NY&date=" + day)
+	e.status(r, http.StatusOK)
+	var a availability
+	if err := json.Unmarshal(r.Body.Bytes(), &a); err != nil || a.StartTimes == nil {
+		t.Fatalf("decode %s: %v", r.Body.String(), err)
+	}
+	starts := *a.StartTimes
+	// 08:00 and 16:30 EDT on 2026-10-21.
+	if len(starts) != 35 || starts[0] != "2026-10-21T12:00:00Z" || starts[34] != "2026-10-21T20:30:00Z" {
+		t.Fatalf("starts %v, want 35 from 2026-10-21T12:00:00Z to 2026-10-21T20:30:00Z", starts)
+	}
 }

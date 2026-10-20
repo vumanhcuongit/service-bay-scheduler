@@ -196,7 +196,7 @@ components:
       name: X-Request-ID
       in: header
       required: false
-      description: Echoed in the response; generated if absent. A replay carries the current request's id, not the original's.
+      description: Echoed in the response; generated if absent, or if not 1–128 characters of letters, digits, `.`, `_` and `-`. A replay carries the current request's id, not the original's.
       schema:
         type: string
 
