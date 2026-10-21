@@ -107,8 +107,8 @@ sequenceDiagram
     Note over S,P: lock order is fixed: key → dealership → vehicle
     S->>R: ClaimKey(key, hash)
     R->>P: INSERT key row ON CONFLICT (waits on a same-key holder)
+    R-->>S: stored row, if one is fresh
     alt replay: fresh key row, same hash
-        R-->>S: stored outcome
         R->>P: COMMIT (nothing written)
         S-->>H: stored 201 or 409, before the dealership and vehicle locks
     else fresh key row, different hash
@@ -139,7 +139,7 @@ sequenceDiagram
         end
     end
     deactivate P
-    H-->>C: 201 / 409 / 404 / 422, same body on every replay
+    H-->>C: 201 / 409 / 404 / 422, a replay returns the stored 201 or 409 body
 ```
 
 What the diagram leaves out:
@@ -148,10 +148,10 @@ What the diagram leaves out:
 2. A malformed body → **400** from the handler, before the DB is touched.
 3. `lock_timeout` bounds every lock wait from the first statement on (D8). The key claim waits on a same-key holder (D9; 1.1 row 6) for at most 1 s; longer → **503** with `Retry-After: 1`.
 4. The 422 rules run in the D9 order: aligned, `start > now`, service type belongs to the dealership, inside hours (1.1 row 5).
-5. Both locks are held until commit or rollback, so from there the dealership's bookings, and the vehicle's bookings at any dealership, run one at a time (§5); a 404 or 422 never waits on them. They are taken with or without a key. A wait past `lock_timeout` on either → **503** with `Retry-After: 1`, no re-run. The fixed order means no two bookings can wait on each other in a cycle (D8). The checks run vehicle, then bays, then technicians, on the full `[start, end)` with the rules in D4–D7 (1.1 rows 3–5); the first failure is the 409 reason.
+5. Bays and technicians are read before the locks; only technicians with the service's required skill are listed (D3, D4). Both locks are held until commit or rollback, so from there the dealership's bookings, and the vehicle's bookings at any dealership, run one at a time (§5); a 404 or 422 never waits on them. They are taken with or without a key. A wait past `lock_timeout` on either → **503** with `Retry-After: 1`, no re-run. The fixed order means no two bookings can wait on each other in a cycle (D8). The checks run vehicle, then bays, then technicians, on the full `[start, end)` with the rules in D4–D7 (1.1 rows 3–5); the first failure is the 409 reason.
 6. The bay and technician are the first free ones by id (D7). The locks leave the insert no other booking's row to wait on. Key row and appointment commit together (1.1 row 8), and a retry with the same key replays the stored 201 or 409.
 
-**Defensive re-run path.** A booking cannot reach it. Within one dealership, the dealership lock means no other booking inserts between this one's check and its insert. The same vehicle booked at two dealerships at once holds two different dealership locks, but the second booking waits on the vehicle lock, then reads the first's committed row in its checks and gets 409 `vehicle_busy` from its check, with no insert. What is left is a code path that skips the locks, or a mistake in them. If an insert still hits a constraint or a deadlock:
+**Defensive re-run path.** A booking cannot reach it. Within one dealership, the dealership lock means no other booking inserts between this one's check and its insert. The same vehicle booked at two dealerships at once holds two different dealership locks, but the second booking waits on the vehicle lock, then reads the first's committed row and gets 409 `vehicle_busy` from its check, with no insert. What is left is a code path that skips the locks, or a mistake in them. If an insert still hits a constraint or a deadlock:
 
 1. Postgres aborts the loser's transaction; everything in it, including its key row, is gone.
 2. Repository maps the violation to `ErrVehicleBusy` (or `ErrBayTaken`, `ErrTechnicianTaken`), or a deadlock to `ErrDeadlock`.
