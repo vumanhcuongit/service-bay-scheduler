@@ -62,7 +62,7 @@ flowchart TB
     client -->|HTTPS / JSON| rid
     repo --> pg
 
-    classDef marked fill:#ffd966,stroke:#b45f06,stroke-width:2px
+    classDef marked fill:#1f6feb,stroke:#58a6ff,stroke-width:2px,color:#ffffff
     class rid marked
 ```
 
