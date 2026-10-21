@@ -93,33 +93,24 @@ The request-id middleware (★, highlighted) is the outermost layer, so every lo
 ```mermaid
 sequenceDiagram
     participant C as client
-    participant H as handler
     participant S as service
     participant R as repository
     participant P as postgres
 
-    C->>H: POST /appointments, Idempotency-Key
-    H->>H: decode, 400 checks
-    H->>S: Book(req, key)
+    C->>S: POST /appointments (handler: decode, 400 checks)
     S->>R: InTx
+    activate R
     R->>P: BEGIN, SET LOCAL lock_timeout = 1s
-    activate P
     Note over S,P: lock order is fixed: key → dealership → vehicle
     S->>R: ClaimKey(key, hash)
-    R->>P: INSERT key row ON CONFLICT (waits on a same-key holder)
-    R-->>S: stored row, if one is fresh
-    alt replay: fresh key row, same hash
-        R->>P: COMMIT (nothing written)
-        S-->>H: stored 201 or 409, before the dealership and vehicle locks
-    else fresh key row, different hash
-        R->>P: ROLLBACK
-        S-->>H: invalid (422)
+    R->>P: INSERT key row ON CONFLICT (takes the key row lock, waits on a same-key holder)
+    alt fresh key row: same hash → stored response, different hash → 422
+        R->>P: COMMIT or ROLLBACK (releases the key row lock)
     else new key (no row, or one older than 24 h)
         S->>R: get dealership, vehicle, service type
         R->>P: SELECT
-        alt 404 unknown id, or 422 rule fails
+        alt 404 unknown id, then 422 rule fails
             R->>P: ROLLBACK (key row goes too)
-            S-->>H: not found (404) / invalid (422)
         else checks pass
             S->>R: list bays, qualified technicians
             S->>R: LockDealership, then LockVehicle
@@ -127,19 +118,17 @@ sequenceDiagram
             S->>R: vehicle overlap, busy bays and technicians
             alt 409: vehicle_busy, no_bay or no_technician
                 S->>R: SaveKeyOutcome(409)
-                R->>P: UPDATE key row, COMMIT (key row alone)
-                S-->>H: conflict(reason)
+                R->>P: UPDATE key row, COMMIT (no appointment, releases the key row and both locks)
             else bay and technician free
                 S->>R: InsertAppointment(first free bay, technician)
                 S->>R: SaveKeyOutcome(201)
-                R->>P: INSERT appointment, UPDATE key row, COMMIT
+                R->>P: INSERT appointment, UPDATE key row, COMMIT (releases the key row and both locks)
                 Note over R,P: key row and appointment commit together
-                S-->>H: created
             end
         end
     end
-    deactivate P
-    H-->>C: 201 / 409 / 404 / 422, a replay returns the stored 201 or 409 body
+    deactivate R
+    S-->>C: status + body
 ```
 
 What the diagram leaves out:
@@ -162,7 +151,7 @@ A deadlock between two inserts on such a path rarely reaches step 2 as a deadloc
 
 A side effect worth knowing: while A waits for its re-run, its key row doesn't exist. A same-key request B that was waiting on it runs as new, and A's re-run then waits on B's key row and replays B's result. The outcome is still one booking per key.
 
-**Idempotent replay path.** The diagram's first two branches. No 404/422/409 checks run on a replay, so it still works after `start` has passed (spec M18). `X-Request-ID` on the response is the current request's, not the original's.
+**Idempotent replay path.** The diagram's first branch. The commit or rollback releases the key row lock, which is what a same-key waiter is waiting on (D9). No 404/422/409 checks run on a replay, so it still works after `start` has passed (spec M18). `X-Request-ID` on the response is the current request's, not the original's.
 
 Without a key, `ClaimKey` and `SaveKeyOutcome` are skipped. Both locks are still taken; the rest is the same.
 
