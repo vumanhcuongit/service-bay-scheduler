@@ -17,10 +17,10 @@ A booking system earns trust by never doing a small number of things. This desig
 | Failure | What prevents it | Read | Test |
 |---|---|---|---|
 | Two cars booked into the same bay, or with the same technician, at the same time | Postgres refuses the second overlapping row (exclusion constraints). The check in Go only explains why; it is not what keeps the calendar correct | §5, D8 | [`TestConstraintsHoldWithoutLocks`](../spectest/concurrency_test.go) (M25 and N36 with both locks off), [`testdb_test.go`](../internal/testdb/testdb_test.go) (direct inserts refused by constraint name); with the locks on, [N36](../spectest/concurrency_test.go) and [M25](../spectest/concurrency_test.go), run 20× in CI |
-| One car booked in two places at once | a third exclusion constraint, on the vehicle; and a vehicle lock, so the same car at two dealerships queues instead of racing | §4 step 5, §5, D8 | [`TestConstraintsHoldWithoutLocks`](../spectest/concurrency_test.go) (the same car at two dealerships, locks off: only the vehicle constraint is left to stop it), [`testdb_test.go`](../internal/testdb/testdb_test.go); with the locks on, [`TestVehicleAtTwoDealerships`](../spectest/concurrency_test.go) (the loser gets its 409 from the check, with no deadlock) and [N37](../spectest/concurrency_test.go) (same dealership) |
-| A booking confirmed when only the bay or only the technician was free, or when one of them was free at the start but busy later in the job | both must be free for the whole `[start, end)`; the check runs on the full interval, and the constraints use the full interval too | §4 step 5, D6, D7 | [N9](../spectest/conflict_test.go), [N10](../spectest/conflict_test.go), [N11](../spectest/conflict_test.go) |
-| A job given to someone who cannot do it | technicians are filtered by the service's required skill before any are considered | §4 step 5, D3, D4 | [N14](../spectest/conflict_test.go), [N15](../spectest/conflict_test.go) |
-| A job that runs past closing time, or past the technician's shift | the whole `[start, end)` must fit inside the dealership's hours and the technician's window | §4 steps 4–5, D2, D4 | [N1–N3](../spectest/time_test.go), [N16](../spectest/conflict_test.go) |
+| One car booked in two places at once | a third exclusion constraint, on the vehicle; and a vehicle lock, so the same car at two dealerships queues instead of racing | §4 (locks and checks), §5, D8 | [`TestConstraintsHoldWithoutLocks`](../spectest/concurrency_test.go) (the same car at two dealerships, locks off: only the vehicle constraint is left to stop it), [`testdb_test.go`](../internal/testdb/testdb_test.go); with the locks on, [`TestVehicleAtTwoDealerships`](../spectest/concurrency_test.go) (the loser gets its 409 from the check, with no deadlock) and [N37](../spectest/concurrency_test.go) (same dealership) |
+| A booking confirmed when only the bay or only the technician was free, or when one of them was free at the start but busy later in the job | both must be free for the whole `[start, end)`; the check runs on the full interval, and the constraints use the full interval too | §4 (locks and checks), D6, D7 | [N9](../spectest/conflict_test.go), [N10](../spectest/conflict_test.go), [N11](../spectest/conflict_test.go) |
+| A job given to someone who cannot do it | technicians are filtered by the service's required skill before any are considered | §4 (locks and checks), D3, D4 | [N14](../spectest/conflict_test.go), [N15](../spectest/conflict_test.go) |
+| A job that runs past closing time, or past the technician's shift | the whole `[start, end)` must fit inside the dealership's hours and the technician's window | §4, D2, D4 | [N1–N3](../spectest/time_test.go), [N16](../spectest/conflict_test.go) |
 | A customer who retries ends up with two appointments | the idempotency key is claimed inside the same transaction as the booking; a retry replays the first answer | §4, D9 | [M15](../spectest/idempotency_test.go), [M17](../spectest/concurrency_test.go) |
 | A customer turned away while another bay was free | the dealership lock runs its bookings one at a time, so every check sees the bookings committed before it and a second bay is never lost to a race. The fresh look at the calendar a retry used to give is no longer needed | §4, §5, D8 | [M25](../spectest/concurrency_test.go), [TenRacers](../spectest/concurrency_test.go) |
 | A booking saved without its key, or a key saved without its booking | both rows commit or roll back together; nothing is written outside the transaction | §4, §5, D9 | [N38](../spectest/concurrency_test.go) |
@@ -109,12 +109,13 @@ sequenceDiagram
     else new key (no row, or one older than 24 h)
         S->>R: get dealership, vehicle, service type
         R->>P: SELECT
-        alt 404 unknown id, then 422 rule fails
+        alt unknown id → 404, or a 422 rule fails
             R->>P: ROLLBACK (key row goes too)
         else checks pass
             S->>R: list bays, qualified technicians
             S->>R: LockDealership, then LockVehicle
             R->>P: pg_advisory_xact_lock × 2
+            Note right of P: wait > 1 s → 503, no re-run
             S->>R: vehicle overlap, busy bays and technicians
             alt 409: vehicle_busy, no_bay or no_technician
                 S->>R: SaveKeyOutcome(409)
@@ -135,10 +136,11 @@ What the diagram leaves out:
 
 1. Request-id middleware sets the id. Access middleware logs the request in and starts the latency timer; on the way out it logs the result and records the metrics (§7).
 2. A malformed body → **400** from the handler, before the DB is touched.
-3. `lock_timeout` bounds every lock wait from the first statement on (D8). The key claim waits on a same-key holder (D9; 1.1 row 6) for at most 1 s; longer → **503** with `Retry-After: 1`.
+3. `lock_timeout` bounds every lock wait from the first statement on (D8). The key claim waits on a same-key holder (D9; 1.1 row 6) for at most 1 s; longer → **503** with `Retry-After: 1`. Each wait is bounded by 1 s; the request as a whole by the 5 s deadline.
 4. The 422 rules run in the D9 order: aligned, `start > now`, service type belongs to the dealership, inside hours (1.1 row 5).
-5. Bays and technicians are read before the locks; only technicians with the service's required skill are listed (D3, D4). Both locks are held until commit or rollback, so from there the dealership's bookings, and the vehicle's bookings at any dealership, run one at a time (§5); a 404 or 422 never waits on them. They are taken with or without a key. A wait past `lock_timeout` on either → **503** with `Retry-After: 1`, no re-run. The fixed order means no two bookings can wait on each other in a cycle (D8). The checks run vehicle, then bays, then technicians, on the full `[start, end)` with the rules in D4–D7 (1.1 rows 3–5); the first failure is the 409 reason.
-6. The bay and technician are the first free ones by id (D7). The locks leave the insert no other booking's row to wait on. Key row and appointment commit together (1.1 row 8), and a retry with the same key replays the stored 201 or 409.
+5. Locks: the dealership's, then the vehicle's, taken after the 404 and 422 checks, with or without a key. Both are held until commit or rollback, so from there the dealership's bookings, and the vehicle's bookings at any dealership, run one at a time (§5); a 404 or 422 never waits on them. The fixed order means no two bookings can wait on each other in a cycle (D8). A wait past `lock_timeout` (1 s) on either → **503** with `Retry-After: 1`, no re-run.
+6. Checks: bays and technicians are read before the locks, and only technicians with the service's required skill are listed (D3, D4). After the locks the checks run vehicle, then bays, then technicians, on the full `[start, end)` with the rules in D4–D7 (1.1 rows 3–5); the first failure is the 409 reason.
+7. Assignment: the bay and technician are the first free ones by id (D7). The locks leave the insert no other booking's row to wait on. Key row and appointment commit together (1.1 row 8), and a retry with the same key replays the stored 201 or 409.
 
 **Defensive re-run path.** A booking cannot reach it. Within one dealership, the dealership lock means no other booking inserts between this one's check and its insert. The same vehicle booked at two dealerships at once holds two different dealership locks, but the second booking waits on the vehicle lock, then reads the first's committed row and gets 409 `vehicle_busy` from its check, with no insert. What is left is a code path that skips the locks, or a mistake in them. If an insert still hits a constraint or a deadlock:
 
